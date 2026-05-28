@@ -63,6 +63,16 @@ function ensureVaultExists(vPath) {
 
 ensureVaultExists(vaultPath);
 
+/** @typedef {import('./src/types').ExplorerNode} ExplorerNode */
+/** @typedef {import('./src/types').FolderNode} FolderNode */
+/** @typedef {import('./src/types').FileNode} FileNode */
+
+/**
+ * Recursively reads directory contents to build an ExplorerNode tree.
+ * @param {string} dirPath - Absolute path of the directory
+ * @param {string} [relativeDir] - Relative directory path from vault root
+ * @returns {ExplorerNode[]} Array of ExplorerNode representing files and folders
+ */
 function readDirectoryRecursive(dirPath, relativeDir = '') {
   const result = [];
   const files = fs.readdirSync(dirPath, { withFileTypes: true });

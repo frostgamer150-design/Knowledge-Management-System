@@ -1,8 +1,16 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus, Eye } from 'lucide-react';
 import { fileService } from './file_Service';
 import { vaultService } from './vault_Service';
 import type { ExplorerNode, VaultInfo } from './types';
+
+// Runtime Engine imports
+import { SyncManager } from './runtime/sync/sync-manager';
+import { KnowledgeQueryEngine } from './runtime/graph/knowledge-query-engine';
+import { resolveLinkPath } from './runtime/graph/link-resolver';
+import { extractBlocksFromMarkdown } from './runtime/parser/block-extractor';
+import { tokenizeInlineContent } from './runtime/parser/runtime-builder';
+import type { InlineNode } from './runtime/types/runtime-types';
 
 type ToastType = 'create-file' | 'create-folder' | 'modify' | 'delete' | 'vault';
 interface Toast {
@@ -70,6 +78,10 @@ function App() {
     node: ExplorerNode | null;
   }>({ visible: false, x: 0, y: 0, node: null });
 
+  // Structured Knowledge Runtime UI states
+  const [isEditMode, setIsEditMode] = useState<boolean>(true);
+  const [scanTrigger, setScanTrigger] = useState<number>(0);
+
   // Drag & Drop State
   const [draggedNode, setDraggedNode] = useState<ExplorerNode | null>(null);
   const [draggedOverFolder, setDraggedOverFolder] = useState<string | null>(null);
@@ -84,11 +96,51 @@ function App() {
     setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000);
   }, []);
 
-  // Load Vault and directory list on mount
-  useEffect(() => {
-    loadVaultInfo();
-    loadTree();
+  // Recursively gets all .md files from Explorer trees
+  const getMdFilesFromTree = useCallback((nodes: ExplorerNode[]): string[] => {
+    const result: string[] = [];
+    const traverse = (nList: ExplorerNode[]) => {
+      for (const n of nList) {
+        if (n.isFolder) {
+          if (n.children) traverse(n.children);
+        } else {
+          if (n.path.endsWith('.md')) {
+            result.push(n.path);
+          }
+        }
+      }
+    };
+    traverse(nodes);
+    return result;
   }, []);
+
+  // Background full scan of the vault
+  const initialVaultScan = useCallback(async (tree: ExplorerNode[]) => {
+    const mdFiles = getMdFilesFromTree(tree);
+    const syncManager = SyncManager.getInstance();
+    syncManager.handleVaultSwitch(); // reset registries & indexes
+
+    for (const filePath of mdFiles) {
+      try {
+        const content = await fileService.readFile(filePath);
+        syncManager.handleFileChange(filePath, content, mdFiles);
+      } catch (err) {
+        console.error('Failed to parse file during initial scan:', filePath, err);
+      }
+    }
+    setScanTrigger(prev => prev + 1);
+  }, [getMdFilesFromTree]);
+
+  // Load Vault and directory list on mount with full vault scan
+  useEffect(() => {
+    const initialize = async () => {
+      await loadVaultInfo();
+      const tree = await fileService.getVaultTree();
+      setDirectoryTrees(tree);
+      await initialVaultScan(tree);
+    };
+    initialize();
+  }, [initialVaultScan]);
 
   // Global click event to close Context Menu
   useEffect(() => {
@@ -112,9 +164,30 @@ function App() {
     const electron = window.electron;
     if (!electron) return;
 
-    
-    electron.onVaultTreeChanged((payload: { event: string; type: string; path: string }) => {
-      loadTree();
+    electron.onVaultTreeChanged(async (payload: { event: string; type: string; path: string }) => {
+      // Reload filesystem tree representation
+      const tree = await fileService.getVaultTree();
+      setDirectoryTrees(tree);
+
+      const allPaths = getMdFilesFromTree(tree);
+      const syncManager = SyncManager.getInstance();
+
+      // Incremental sync of structured knowledge objects
+      if (payload.type === 'file' && payload.path.endsWith('.md')) {
+        if (payload.event === 'create' || payload.event === 'modify') {
+          try {
+            const content = await fileService.readFile(payload.path);
+            syncManager.handleFileChange(payload.path, content, allPaths);
+            setScanTrigger(prev => prev + 1); // reactive refresh properties/backlinks
+          } catch (err) {
+            console.error('Failed incremental sync for file:', payload.path, err);
+          }
+        } else if (payload.event === 'delete') {
+          syncManager.handleFileDelete(payload.path, allPaths);
+          setScanTrigger(prev => prev + 1); // reactive refresh
+        }
+      }
+
       if (payload.event === 'create' && payload.type === 'file') {
         addToast('create-file', `Created ${payload.path.split('/').pop()}`);
       } else if (payload.event === 'create' && payload.type === 'folder') {
@@ -126,9 +199,11 @@ function App() {
       }
     });
 
-    electron.onVaultChanged((payload: { path: string }) => {
-      loadVaultInfo();
-      loadTree();
+    electron.onVaultChanged(async (payload: { path: string }) => {
+      await loadVaultInfo();
+      const tree = await fileService.getVaultTree();
+      setDirectoryTrees(tree);
+      await initialVaultScan(tree);
       addToast('vault', `Vault switched to ${payload.path.split(/[\\/]/).pop()}`);
     });
 
@@ -136,7 +211,7 @@ function App() {
       electron.offVaultTreeChanged();
       electron.offVaultChanged();
     };
-  }, [addToast]);
+  }, [addToast, getMdFilesFromTree, initialVaultScan]);
 
   const loadVaultInfo = async () => {
     setIsLoadingVault(true);
@@ -390,20 +465,35 @@ function App() {
 
   // Helper to save current file content
   const saveCurrentFile = async () => {
-    if (activeFilePath && contentRef.current) {
+    if (activeFilePath && contentRef.current && isEditMode) {
       try {
         const currentContent = contentRef.current.innerText;
         await fileService.writeFile(activeFilePath, currentContent);
+        
+        // Sync the change in syncManager
+        const allPaths = getMdFilesFromTree(directoryTrees);
+        SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
+        setScanTrigger(prev => prev + 1);
       } catch (err) {
         console.error('Failed to save current file:', err);
       }
     }
   };
 
+  // Sync content inside contentRef when entering edit mode or changing notes
+  useEffect(() => {
+    if (isEditMode && activeFilePath && contentRef.current) {
+      fileService.readFile(activeFilePath).then(content => {
+        if (contentRef.current) {
+          contentRef.current.innerText = content;
+        }
+      });
+    }
+  }, [activeFilePath, isEditMode]);
+
   // Selecting a file with Preview & Ctrl+Click rules
   const handleSelectFile = async (path: string, isCtrlClick = false) => {
     try {
-      // Capture state before async saveCurrentFile yield to avoid stale closures
       const currentActiveTabPath = activeTabPath;
 
       // Save currently active file first
@@ -419,10 +509,8 @@ function App() {
 
         let newTabs = [...prev];
         if (isCtrlClick || prev.length === 0 || !currentActiveTabPath) {
-          // Open in a new tab
           newTabs.push({ path, title });
         } else {
-          // Preview (Single Click): replace the currently active tab
           const activeIdx = prev.findIndex(t => t.path === currentActiveTabPath);
           if (activeIdx >= 0) {
             newTabs[activeIdx] = { path, title };
@@ -435,11 +523,7 @@ function App() {
 
       setActiveTabPath(path);
       setActiveFilePath(path);
-      const content = await fileService.readFile(path);
       setActiveFileTitle(title);
-      if (contentRef.current) {
-        contentRef.current.innerText = content;
-      }
     } catch (err) {
       console.error(err);
     }
@@ -451,19 +535,14 @@ function App() {
     await saveCurrentFile();
     setActiveTabPath(path);
     setActiveFilePath(path);
-    const content = await fileService.readFile(path);
     const title = path.split('/').pop()?.replace('.md', '') || 'Untitled';
     setActiveFileTitle(title);
-    if (contentRef.current) {
-      contentRef.current.innerText = content;
-    }
   };
 
   // Close Tab
   const handleCloseTab = async (e: React.MouseEvent, path: string) => {
     e.stopPropagation();
     
-    // Capture state before async saveCurrentFile yield to avoid stale closures
     const currentActiveTabPath = activeTabPath;
     const currentOpenTabs = openTabs;
 
@@ -481,20 +560,233 @@ function App() {
         const nextActivePath = newTabs[nextActiveIdx].path;
         setActiveTabPath(nextActivePath);
         setActiveFilePath(nextActivePath);
-        const content = await fileService.readFile(nextActivePath);
         const title = nextActivePath.split('/').pop()?.replace('.md', '') || 'Untitled';
         setActiveFileTitle(title);
-        if (contentRef.current) {
-          contentRef.current.innerText = content;
-        }
       } else {
         setActiveTabPath(null);
         setActiveFilePath(null);
         setActiveFileTitle('Untitled');
-        if (contentRef.current) {
-          contentRef.current.innerText = '';
-        }
       }
+    }
+  };
+
+  // Wikilink click navigator and creator
+  const handleWikilinkClick = async (target: string) => {
+    const allPaths = getMdFilesFromTree(directoryTrees);
+    const resolved = resolveLinkPath(target, activeFilePath || '', allPaths);
+    
+    if (resolved) {
+      handleSelectFile(resolved);
+    } else {
+      const name = target.trim();
+      const relativePath = name.endsWith('.md') ? name : `${name}.md`;
+      const confirmCreate = window.confirm(`Note "${name}" does not exist. Do you want to create it?`);
+      if (!confirmCreate) return;
+
+      try {
+        await fileService.createFile(relativePath, `# ${name.split('/').pop()?.replace('.md', '')}\n\n`);
+        addToast('create-file', `Auto-created note: ${relativePath}`);
+        
+        // Pre-cache in SyncManager
+        const syncManager = SyncManager.getInstance();
+        const updatedAllPaths = [...allPaths, relativePath];
+        syncManager.handleFileChange(relativePath, `# ${name.split('/').pop()?.replace('.md', '')}\n\n`, updatedAllPaths);
+
+        await loadTree();
+        await handleSelectFile(relativePath);
+      } catch (err) {
+        console.error('Failed to auto-create note via wikilink:', err);
+        addToast('delete', `Failed to create note: ${name}`);
+      }
+    }
+  };
+
+  const handleHashtagClick = (tag: string) => {
+    addToast('vault', `Filtering by tag: #${tag}`);
+  };
+
+  // Embed note preview viewer
+  const EmbeddedNoteView = ({ path }: { path: string }) => {
+    const allPaths = getMdFilesFromTree(directoryTrees);
+    const resolvedPath = resolveLinkPath(path, activeFilePath || '', allPaths);
+    const [content, setContent] = useState<string>('');
+
+    useEffect(() => {
+      if (resolvedPath) {
+        fileService.readFile(resolvedPath).then(setContent);
+      }
+    }, [resolvedPath]);
+
+    if (!resolvedPath) {
+      return <div className="text-xs text-red-400 italic">Target [[{path}]] not found.</div>;
+    }
+
+    const blocks = extractBlocksFromMarkdown(content, resolvedPath);
+    return (
+      <div className="space-y-2 border-l-2 border-blue-500/30 pl-4 py-1 text-sm text-gray-400 select-text">
+        {blocks.map((block) => (
+          <div key={block.id}>{renderInline(block.children)}</div>
+        ))}
+      </div>
+    );
+  };
+
+  // Render Inline children nodes
+  const renderInline = (nodes: InlineNode[]) => {
+    return nodes.map((node, idx) => {
+      switch (node.type) {
+        case 'text':
+          return <span key={idx}>{node.content}</span>;
+        case 'wikilink':
+          return (
+            <span
+              key={idx}
+              className="wikilink text-blue-400 hover:text-blue-300 underline underline-offset-4 cursor-pointer font-medium"
+              onClick={() => handleWikilinkClick(node.content)}
+            >
+              {node.raw}
+            </span>
+          );
+        case 'embed':
+          return (
+            <div key={idx} className="my-4 p-4 rounded-xl border border-white/10 bg-white/5 no-drag text-left">
+              <div className="text-[10px] text-gray-500 uppercase tracking-widest mb-2 flex items-center gap-1.5 font-bold font-sans">
+                <Link2 className="w-3 h-3" /> Embed: {node.content}
+              </div>
+              <EmbeddedNoteView path={node.content} />
+            </div>
+          );
+        case 'hashtag':
+          return (
+            <span
+              key={idx}
+              className="hashtag text-emerald-400 hover:text-emerald-300 cursor-pointer font-medium bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 text-xs inline-block m-0.5"
+              onClick={() => handleHashtagClick(node.content)}
+            >
+              {node.raw}
+            </span>
+          );
+        case 'bold':
+          return <strong key={idx} className="font-bold text-white">{node.content}</strong>;
+        case 'italic':
+          return <em key={idx} className="italic text-gray-300">{node.content}</em>;
+        case 'code':
+          return <code key={idx} className="bg-[#1e2230] text-blue-300 px-1.5 py-0.5 rounded font-mono text-sm">{node.content}</code>;
+        default:
+          return <span key={idx}>{node.raw}</span>;
+      }
+    });
+  };
+
+  // Render Structured blocks
+  const renderBlock = (block: any) => {
+    const headingClasses = [
+      '',
+      'text-4xl font-bold text-white mt-8 mb-4 border-b border-white/5 pb-2',
+      'text-2xl font-semibold text-white mt-6 mb-3',
+      'text-xl font-semibold text-gray-100 mt-4 mb-2',
+      'text-lg font-medium text-gray-200 mt-3 mb-1.5',
+      'text-md font-medium text-gray-300 mt-2 mb-1',
+      'text-sm font-medium text-gray-400 mt-2 mb-1'
+    ];
+
+    switch (block.type) {
+      case 'heading':
+        const hLevel = block.level || 1;
+        const TagName = `h${hLevel}` as any;
+        return (
+          <TagName key={block.id} className={headingClasses[hLevel]}>
+            {renderInline(block.children)}
+          </TagName>
+        );
+
+      case 'paragraph':
+        return (
+          <p key={block.id} className="mb-4 text-gray-300 leading-relaxed text-left">
+            {renderInline(block.children)}
+          </p>
+        );
+
+      case 'list-item':
+        const indentLevel = block.level || 0;
+        const indentStyle = { paddingLeft: `${indentLevel * 1.5}rem` };
+        const isTask = block.content.trim().startsWith('[ ]') || block.content.trim().startsWith('[x]');
+        
+        if (isTask) {
+          const checked = block.content.trim().startsWith('[x]');
+          const cleanText = block.content.trim().substring(3).trim();
+          const cleanInlineNodes = tokenizeInlineContent(cleanText);
+          return (
+            <div key={block.id} style={indentStyle} className="flex items-start gap-2.5 my-1.5 text-gray-300 text-left">
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled
+                className="mt-1.5 accent-blue-500 rounded cursor-default"
+              />
+              <span className={checked ? 'line-through text-gray-500' : ''}>
+                {renderInline(cleanInlineNodes)}
+              </span>
+            </div>
+          );
+        }
+
+        return (
+          <div key={block.id} style={indentStyle} className="flex items-start gap-2.5 my-1.5 text-gray-300 text-left">
+            <span className="text-blue-500 mt-1 select-none font-bold text-lg leading-none">•</span>
+            <span className="flex-1">{renderInline(block.children)}</span>
+          </div>
+        );
+
+      case 'quote':
+        return (
+          <blockquote key={block.id} className="border-l-4 border-blue-500/40 bg-white/5 p-4 rounded-r-xl my-4 text-gray-400 italic text-left">
+            {renderInline(block.children)}
+          </blockquote>
+        );
+
+      case 'callout':
+        const calloutType = block.info || 'NOTE';
+        let calloutColor = 'border-blue-500 bg-blue-500/5 text-blue-200';
+        let iconColor = 'text-blue-400';
+        if (calloutType === 'WARNING') {
+          calloutColor = 'border-yellow-500 bg-yellow-500/5 text-yellow-200';
+          iconColor = 'text-yellow-400';
+        } else if (calloutType === 'ERROR' || calloutType === 'DANGER') {
+          calloutColor = 'border-red-500 bg-red-500/5 text-red-200';
+          iconColor = 'text-red-400';
+        } else if (calloutType === 'SUCCESS') {
+          calloutColor = 'border-emerald-500 bg-emerald-500/5 text-emerald-200';
+          iconColor = 'text-emerald-400';
+        }
+
+        return (
+          <div key={block.id} className={`border-l-4 p-4 rounded-r-xl my-4 flex flex-col gap-1.5 text-left ${calloutColor}`}>
+            <div className="flex items-center gap-2 font-bold uppercase tracking-wider text-xs">
+              <Tag className={`w-3.5 h-3.5 ${iconColor}`} />
+              <span>{calloutType}</span>
+            </div>
+            <div className="text-sm">{renderInline(block.children)}</div>
+          </div>
+        );
+
+      case 'code':
+        return (
+          <pre key={block.id} className="bg-[#181b24] p-4 rounded-xl border border-white/5 overflow-x-auto my-4 text-sm font-mono text-gray-300 text-left select-text">
+            {block.info && (
+              <div className="text-[10px] text-gray-600 uppercase tracking-widest mb-2 font-bold font-sans">
+                {block.info}
+              </div>
+            )}
+            <code>{block.content}</code>
+          </pre>
+        );
+
+      case 'empty':
+        return <div key={block.id} className="h-4" />;
+
+      default:
+        return <div key={block.id}>{renderInline(block.children)}</div>;
     }
   };
 
@@ -587,12 +879,12 @@ function App() {
   };
 
   // Inline Creation Handlers
-  const handlelCreateFile = () => {
+  const handleCreateFile = () => {
     setCreationTarget({ parentPath: null, isFile: true });
     setNewItemName('');
   };
 
-  const handlelCreateFolder = () => {
+  const handleCreateFolder = () => {
     setCreationTarget({ parentPath: null, isFile: false });
     setNewItemName('');
   };
@@ -699,6 +991,16 @@ function App() {
     return <FolderOpen className="w-4 h-4 text-purple-400 shrink-0" />;
   };
 
+  // Structured Knowledge calculations for rendering
+  const syncManager = SyncManager.getInstance();
+  const queryEngine = KnowledgeQueryEngine.getInstance();
+
+  const allPaths = getMdFilesFromTree(directoryTrees);
+  const activeDoc = useMemo(() => activeFilePath ? syncManager.getDocument(activeFilePath) : null, [activeFilePath, scanTrigger]);
+  const docTags = activeDoc ? activeDoc.tags : [];
+  const mentions = useMemo(() => activeFilePath ? queryEngine.getLinkedMentions(activeFilePath, allPaths) : [], [activeFilePath, allPaths, scanTrigger]);
+  const activeDocBlocks = activeDoc ? activeDoc.blocks : [];
+
   return (
     <div className="w-screen h-screen flex flex-col bg-[#0f1117] text-gray-200 font-sans select-none">
       {/* Toast Notifications */}
@@ -780,7 +1082,7 @@ function App() {
               <div className="flex items-center justify-center mb-3 gap-4 bg-white/5 py-1.5 rounded-lg">
                 <button
                   className="text-gray-400 hover:text-white transition cursor-pointer border-0 outline-none flex items-center gap-1.5 text-xs font-medium"
-                  onClick={handlelCreateFile}
+                  onClick={handleCreateFile}
                   title="Create File"
                 >
                   <File className="w-4 h-4" />
@@ -789,7 +1091,7 @@ function App() {
                 <div className="w-px h-3 bg-white/10" />
                 <button
                   className="text-gray-400 hover:text-white transition cursor-pointer border-0 outline-none flex items-center gap-1.5 text-xs font-medium"
-                  onClick={handlelCreateFolder}
+                  onClick={handleCreateFolder}
                   title="Create Folder"
                 >
                   <Folder className="w-4 h-4" />
@@ -929,18 +1231,51 @@ function App() {
           {/* Editor */}
           <div className="flex-1 overflow-auto px-12 py-10">
             <div className="max-w-4xl mx-auto">
-              {/* Title */}
-              <input
-                type="text"
-                value={activeFileTitle}
-                onChange={(e) => setActiveFileTitle(e.target.value)}
-                className="w-full bg-transparent outline-none text-5xl font-bold text-white placeholder-gray-600"
-                placeholder="Untitled"
-                disabled={!activeFilePath}
-              />
+              {/* Title & Preview Toggle Header */}
+              <div className="flex justify-between items-start gap-4">
+                <input
+                  type="text"
+                  value={activeFileTitle}
+                  onChange={(e) => setActiveFileTitle(e.target.value)}
+                  className="w-full bg-transparent outline-none text-5xl font-bold text-white placeholder-gray-600"
+                  placeholder="Untitled"
+                  disabled={!activeFilePath}
+                />
+
+                {/* Edit / Preview Mode Switcher */}
+                {activeFilePath && (
+                  <div className="flex bg-white/5 p-1 rounded-xl gap-1 shrink-0">
+                    <button
+                      onClick={() => setIsEditMode(true)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${
+                        isEditMode
+                          ? 'bg-blue-600 text-white shadow-md'
+                          : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                      <span>Edit</span>
+                    </button>
+                    <button
+                      onClick={async () => {
+                        await saveCurrentFile();
+                        setIsEditMode(false);
+                      }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${
+                        !isEditMode
+                          ? 'bg-blue-600 text-white shadow-md'
+                          : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                      <span>Preview</span>
+                    </button>
+                  </div>
+                )}
+              </div>
 
               {/* Metadata */}
-              <div className="flex items-center gap-4 mt-4 text-sm text-gray-500">
+              <div className="flex items-center gap-4 mt-4 text-sm text-gray-500 border-b border-white/5 pb-4 mb-6">
                 <span className="flex items-center gap-1.5"><Tag className="w-3.5 h-3.5" />#notes</span>
                 <span className="flex items-center gap-1.5"><Tag className="w-3.5 h-3.5" />#knowledge</span>
                 <span className="flex items-center gap-1.5">
@@ -949,17 +1284,27 @@ function App() {
                 </span>
               </div>
 
-              {/* Content Editor */}
-              <div
-                ref={contentRef}
-                contentEditable={!!activeFilePath}
-                suppressContentEditableWarning={true}
-                onBlur={handleContentBlur}
-                className="mt-10 min-h-[500px] text-[16px] leading-8 text-gray-300 outline-none empty:before:content-[attr(data-placeholder)] empty:before:text-gray-600 empty:before:pointer-events-none"
-                data-placeholder="Start writing your thoughts here..."
-              >
-                <p className="text-gray-500 italic">No note selected. Select a note from the file explorer on the left or create a new file to start writing.</p>
-              </div>
+              {/* Content Editor area */}
+              {isEditMode ? (
+                <div
+                  ref={contentRef}
+                  contentEditable={!!activeFilePath}
+                  suppressContentEditableWarning={true}
+                  onBlur={handleContentBlur}
+                  className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-300 outline-none empty:before:content-[attr(data-placeholder)] empty:before:text-gray-600 empty:before:pointer-events-none select-text"
+                  data-placeholder="Start writing your thoughts here..."
+                >
+                  <p className="text-gray-500 italic">No note selected. Select a note from the file explorer on the left or create a new file to start writing.</p>
+                </div>
+              ) : (
+                <div className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-300 select-text space-y-6">
+                  {activeDocBlocks.length > 0 ? (
+                    activeDocBlocks.map((block) => renderBlock(block))
+                  ) : (
+                    <p className="text-gray-500 italic text-left">This document is empty.</p>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </main>
@@ -979,9 +1324,19 @@ function App() {
                 <Tag className="w-3.5 h-3.5" /> Tags
               </h4>
               <div className="flex flex-wrap gap-2">
-                <span className="px-3 py-1 rounded-full bg-white/5 text-sm text-gray-300">#vault</span>
-                <span className="px-3 py-1 rounded-full bg-white/5 text-sm text-gray-300">#electron</span>
-                <span className="px-3 py-1 rounded-full bg-white/5 text-sm text-gray-300">#knowledge</span>
+                {docTags.length > 0 ? (
+                  docTags.map(tag => (
+                    <span
+                      key={tag}
+                      onClick={() => handleHashtagClick(tag)}
+                      className="px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-xs font-semibold text-emerald-300 cursor-pointer hover:bg-emerald-500/20 transition"
+                    >
+                      #{tag}
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-xs text-gray-500 italic">No tags in this note</span>
+                )}
               </div>
             </div>
 
@@ -992,16 +1347,16 @@ function App() {
               </h4>
               <div className="space-y-3 text-sm">
                 <div className="flex justify-between">
-                  <span className="text-gray-500">Created</span>
-                  <span>May 19</span>
+                  <span className="text-gray-500">Words</span>
+                  <span className="text-gray-300 font-semibold">{activeDoc?.wordCount || 0}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-500">Modified</span>
-                  <span>Just now</span>
+                  <span className="text-gray-500">Characters</span>
+                  <span className="text-gray-300 font-semibold">{activeDoc?.charCount || 0}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-gray-500">Path</span>
-                  <span className="truncate max-w-[150px]" title={activeFilePath || ''}>
+                  <span className="truncate max-w-[150px] text-gray-300" title={activeFilePath || ''}>
                     {activeFilePath || 'None'}
                   </span>
                 </div>
@@ -1014,23 +1369,28 @@ function App() {
                 <Link2 className="w-3.5 h-3.5" /> Backlinks
               </h4>
               <div className="space-y-2">
-                <div className="p-3 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer transition flex flex-col">
-                  <div className="flex items-center gap-1.5 text-sm text-white">
-                    <FileText className="w-3.5 h-3.5 text-blue-400" />
-                    <span>system-design.md</span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1 pl-5">
-                    References this note in architecture section.
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer transition flex flex-col">
-                  <div className="flex items-center gap-1.5 text-sm text-white">
-                    <FileText className="w-3.5 h-3.5 text-gray-400" />
-                    <span>daily-note.md</span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1 pl-5">Mentioned during planning.</div>
-                </div>
+                {mentions.length > 0 ? (
+                  mentions.map((mention, idx) => {
+                    const sourceFileTitle = mention.sourceFile.split('/').pop()?.replace('.md', '') || 'Untitled';
+                    return (
+                      <div
+                        key={idx}
+                        onClick={() => handleSelectFile(mention.sourceFile)}
+                        className="p-3 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer transition flex flex-col border border-white/5"
+                      >
+                        <div className="flex items-center gap-1.5 text-sm font-semibold text-white">
+                          <FileText className="w-3.5 h-3.5 text-blue-400" />
+                          <span>{sourceFileTitle}</span>
+                        </div>
+                        <div className="text-xs text-gray-400 mt-1.5 pl-5 border-l border-blue-500/20 py-0.5 truncate italic text-left">
+                          {mention.block.content}
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <span className="text-xs text-gray-500 italic">No backlinks referencing this note</span>
+                )}
               </div>
             </div>
           </div>

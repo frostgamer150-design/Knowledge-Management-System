@@ -9,8 +9,9 @@ import { SyncManager } from './runtime/sync/sync-manager';
 import { KnowledgeQueryEngine } from './runtime/graph/knowledge-query-engine';
 import { resolveLinkPath } from './runtime/graph/link-resolver';
 import { extractBlocksFromMarkdown } from './runtime/parser/block-extractor';
-import { tokenizeInlineContent } from './runtime/parser/runtime-builder';
-import type { InlineNode } from './runtime/types/runtime-types';
+import { serializeBlocksToMarkdown } from './runtime/parser/markdown-parser';
+import type { InlineNode, RuntimeBlock } from './runtime/types/runtime-types';
+import { BlockEditor } from './components/BlockEditor';
 
 type ToastType = 'create-file' | 'create-folder' | 'modify' | 'delete' | 'vault';
 interface Toast {
@@ -80,6 +81,7 @@ function App() {
 
   // Structured Knowledge Runtime UI states
   const [isEditMode, setIsEditMode] = useState<boolean>(true);
+  const [editorBlocks, setEditorBlocks] = useState<RuntimeBlock[]>([]);
   const [scanTrigger, setScanTrigger] = useState<number>(0);
 
   // Drag & Drop State
@@ -89,6 +91,15 @@ function App() {
   // Toast State
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastIdRef = useRef(0);
+  const ignoredWatcherPathsRef = useRef<{ path: string; event: 'create' | 'modify' | 'delete'; timestamp: number }[]>([]);
+
+  const ignoreWatcherToast = useCallback((path: string, event: 'create' | 'modify' | 'delete') => {
+    ignoredWatcherPathsRef.current.push({
+      path: path.replace(/\\/g, '/'),
+      event,
+      timestamp: Date.now()
+    });
+  }, []);
 
   const addToast = useCallback((type: ToastType, message: string) => {
     const id = ++toastIdRef.current;
@@ -188,14 +199,28 @@ function App() {
         }
       }
 
-      if (payload.event === 'create' && payload.type === 'file') {
-        addToast('create-file', `Created ${payload.path.split('/').pop()}`);
-      } else if (payload.event === 'create' && payload.type === 'folder') {
-        addToast('create-folder', `Folder added: ${payload.path.split('/').pop()}`);
-      } else if (payload.event === 'modify') {
-        addToast('modify', `Modified ${payload.path.split('/').pop()}`);
-      } else if (payload.event === 'delete') {
-        addToast('delete', `Deleted ${payload.path.split('/').pop()}`);
+      // Clean up old ignored paths (older than 3 seconds)
+      const now = Date.now();
+      ignoredWatcherPathsRef.current = ignoredWatcherPathsRef.current.filter(item => now - item.timestamp < 3000);
+
+      // Check if this path should be ignored.
+      // We check if the payload.path exactly matches or (in case of a folder delete/create) starts with the ignored path.
+      const normPath = payload.path.replace(/\\/g, '/');
+      const shouldIgnoreToast = ignoredWatcherPathsRef.current.some(item => {
+        if (item.event !== payload.event) return false;
+        return normPath === item.path || normPath.startsWith(item.path + '/');
+      });
+
+      if (!shouldIgnoreToast) {
+        if (payload.event === 'create' && payload.type === 'file') {
+          addToast('create-file', `Created ${payload.path.split('/').pop()}`);
+        } else if (payload.event === 'create' && payload.type === 'folder') {
+          addToast('create-folder', `Folder added: ${payload.path.split('/').pop()}`);
+        } else if (payload.event === 'modify') {
+          addToast('modify', `Modified ${payload.path.split('/').pop()}`);
+        } else if (payload.event === 'delete') {
+          addToast('delete', `Deleted ${payload.path.split('/').pop()}`);
+        }
       }
     });
 
@@ -283,6 +308,8 @@ function App() {
 
     const res = await fileService.moveItem(oldPath, newPath);
     if (res.success) {
+      ignoreWatcherToast(oldPath, 'delete');
+      ignoreWatcherToast(newPath, 'create');
       addToast('modify', `Moved ${fileName} to ${folderNode.name}`);
       setExpandedFolders(prev => ({ ...prev, [folderNode.path]: true }));
     } else {
@@ -318,6 +345,8 @@ function App() {
 
     const res = await fileService.moveItem(oldPath, newPath);
     if (res.success) {
+      ignoreWatcherToast(oldPath, 'delete');
+      ignoreWatcherToast(newPath, 'create');
       addToast('modify', `Moved ${fileName} to Vault Root`);
     } else {
       addToast('delete', `Failed to move: ${res.error || 'Unknown error'}`);
@@ -371,11 +400,10 @@ function App() {
               onDrop={(e) => handleDropOnFolder(e, node)}
               onClick={() => setExpandedFolders(prev => ({ ...prev, [node.path]: !prev[node.path] }))}
               onContextMenu={(e) => handleContextMenu(e, node)}
-              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer text-gray-300 transition-all duration-150 ${
-                isDraggedOver
+              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer text-gray-300 transition-all duration-150 ${isDraggedOver
                   ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 shadow-[0_0_15px_rgba(16,185,129,0.15)] scale-[1.02]'
                   : 'hover:bg-white/5'
-              }`}
+                }`}
             >
               {isOpen ? (
                 <ChevronDown className="w-4 h-4 text-gray-400 shrink-0" />
@@ -390,11 +418,10 @@ function App() {
               <div className="ml-4 mt-0.5 border-l border-white/5 pl-2 space-y-0.5">
                 {/* Inline Creation under this Folder */}
                 {creationTarget && creationTarget.parentPath === node.path && (
-                  <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${
-                    creationTarget.isFile 
-                      ? 'bg-blue-500/10 border border-blue-500/20' 
+                  <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${creationTarget.isFile
+                      ? 'bg-blue-500/10 border border-blue-500/20'
                       : 'bg-emerald-500/10 border border-emerald-500/20'
-                  }`}>
+                    }`}>
                     {creationTarget.isFile ? (
                       <FileText className="w-4 h-4 text-blue-400 shrink-0" />
                     ) : (
@@ -465,11 +492,12 @@ function App() {
 
   // Helper to save current file content
   const saveCurrentFile = async () => {
-    if (activeFilePath && contentRef.current && isEditMode) {
+    if (activeFilePath && isEditMode && editorBlocks.length > 0) {
       try {
-        const currentContent = contentRef.current.innerText;
+        const currentContent = serializeBlocksToMarkdown(editorBlocks);
+        ignoreWatcherToast(activeFilePath, 'modify');
         await fileService.writeFile(activeFilePath, currentContent);
-        
+
         // Sync the change in syncManager
         const allPaths = getMdFilesFromTree(directoryTrees);
         SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
@@ -480,16 +508,35 @@ function App() {
     }
   };
 
-  // Sync content inside contentRef when entering edit mode or changing notes
-  useEffect(() => {
-    if (isEditMode && activeFilePath && contentRef.current) {
-      fileService.readFile(activeFilePath).then(content => {
-        if (contentRef.current) {
-          contentRef.current.innerText = content;
-        }
-      });
+  // Helper to save block updates directly
+  const saveBlocksDirectly = async (blocksToSave: RuntimeBlock[]) => {
+    if (activeFilePath) {
+      try {
+        const currentContent = serializeBlocksToMarkdown(blocksToSave);
+        ignoreWatcherToast(activeFilePath, 'modify');
+        await fileService.writeFile(activeFilePath, currentContent);
+
+        // Sync the change in syncManager
+        const allPaths = getMdFilesFromTree(directoryTrees);
+        SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
+        setScanTrigger(prev => prev + 1);
+      } catch (err) {
+        console.error('Failed to save blocks directly:', err);
+      }
     }
-  }, [activeFilePath, isEditMode]);
+  };
+
+  // Sync blocks when active note changes
+  useEffect(() => {
+    if (activeFilePath) {
+      fileService.readFile(activeFilePath).then(content => {
+        const blocks = extractBlocksFromMarkdown(content, activeFilePath);
+        setEditorBlocks(blocks);
+      });
+    } else {
+      setEditorBlocks([]);
+    }
+  }, [activeFilePath]);
 
   // Selecting a file with Preview & Ctrl+Click rules
   const handleSelectFile = async (path: string, isCtrlClick = false) => {
@@ -542,7 +589,7 @@ function App() {
   // Close Tab
   const handleCloseTab = async (e: React.MouseEvent, path: string) => {
     e.stopPropagation();
-    
+
     const currentActiveTabPath = activeTabPath;
     const currentOpenTabs = openTabs;
 
@@ -574,7 +621,7 @@ function App() {
   const handleWikilinkClick = async (target: string) => {
     const allPaths = getMdFilesFromTree(directoryTrees);
     const resolved = resolveLinkPath(target, activeFilePath || '', allPaths);
-    
+
     if (resolved) {
       handleSelectFile(resolved);
     } else {
@@ -584,9 +631,10 @@ function App() {
       if (!confirmCreate) return;
 
       try {
+        ignoreWatcherToast(relativePath, 'create');
         await fileService.createFile(relativePath, `# ${name.split('/').pop()?.replace('.md', '')}\n\n`);
         addToast('create-file', `Auto-created note: ${relativePath}`);
-        
+
         // Pre-cache in SyncManager
         const syncManager = SyncManager.getInstance();
         const updatedAllPaths = [...allPaths, relativePath];
@@ -678,6 +726,37 @@ function App() {
     });
   };
 
+  // Helper to parse tables for Preview Mode
+  const parseTableContentForPreview = (text: string) => {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) return [];
+    const parseRow = (row: string) => {
+      let clean = row;
+      if (clean.startsWith('|')) clean = clean.slice(1);
+      if (clean.endsWith('|')) clean = clean.slice(0, -1);
+      return clean.split('|').map(c => c.trim());
+    };
+    return [parseRow(lines[0]), ...lines.slice(2).map(parseRow)];
+  };
+
+  // Toggle checkbox state directly from Preview Mode
+  const togglePreviewCheckbox = async (blockId: string) => {
+    const updated = editorBlocks.map(b => {
+      if (b.id === blockId) {
+        return {
+          ...b,
+          metadata: {
+            ...b.metadata,
+            checked: !b.metadata?.checked
+          }
+        };
+      }
+      return b;
+    });
+    setEditorBlocks(updated);
+    await saveBlocksDirectly(updated);
+  };
+
   // Render Structured blocks
   const renderBlock = (block: any) => {
     const headingClasses = [
@@ -710,22 +789,20 @@ function App() {
       case 'list-item':
         const indentLevel = block.level || 0;
         const indentStyle = { paddingLeft: `${indentLevel * 1.5}rem` };
-        const isTask = block.content.trim().startsWith('[ ]') || block.content.trim().startsWith('[x]');
-        
+        const isTask = block.metadata?.checked !== undefined;
+
         if (isTask) {
-          const checked = block.content.trim().startsWith('[x]');
-          const cleanText = block.content.trim().substring(3).trim();
-          const cleanInlineNodes = tokenizeInlineContent(cleanText);
+          const checked = !!block.metadata.checked;
           return (
             <div key={block.id} style={indentStyle} className="flex items-start gap-2.5 my-1.5 text-gray-300 text-left">
               <input
                 type="checkbox"
                 checked={checked}
-                disabled
-                className="mt-1.5 accent-blue-500 rounded cursor-default"
+                onChange={() => togglePreviewCheckbox(block.id)}
+                className="mt-1.5 accent-blue-500 rounded cursor-pointer w-4 h-4"
               />
               <span className={checked ? 'line-through text-gray-500' : ''}>
-                {renderInline(cleanInlineNodes)}
+                {renderInline(block.children)}
               </span>
             </div>
           );
@@ -740,7 +817,7 @@ function App() {
 
       case 'quote':
         return (
-          <blockquote key={block.id} className="border-l-4 border-blue-500/40 bg-white/5 p-4 rounded-r-xl my-4 text-gray-400 italic text-left">
+          <blockquote key={block.id} className="border-l-4 border-blue-500/40 bg-white/5 p-4 rounded-r-xl my-4 text-gray-400 italic text-left whitespace-pre-wrap">
             {renderInline(block.children)}
           </blockquote>
         );
@@ -781,6 +858,36 @@ function App() {
             <code>{block.content}</code>
           </pre>
         );
+
+      case 'table': {
+        const grid = parseTableContentForPreview(block.content);
+        return (
+          <div key={block.id} className="my-4 overflow-x-auto border border-white/10 rounded-xl bg-white/5 p-4 text-left">
+            <table className="min-w-full border-collapse">
+              <thead>
+                <tr>
+                  {grid[0]?.map((header, colIdx) => (
+                    <th key={colIdx} className="border border-white/10 p-2 bg-[#1c1f2a] text-white font-semibold text-left">
+                      {header}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {grid.slice(1).map((row, rowIdx) => (
+                  <tr key={rowIdx}>
+                    {row.map((cell, colIdx) => (
+                      <td key={colIdx} className="border border-white/10 p-2 text-gray-300">
+                        {cell}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      }
 
       case 'empty':
         return <div key={block.id} className="h-4" />;
@@ -939,6 +1046,8 @@ function App() {
     try {
       const res = await fileService.moveItem(node.path, newPath);
       if (res.success) {
+        ignoreWatcherToast(node.path, 'delete');
+        ignoreWatcherToast(newPath, 'create');
         updateTabsAfterRename(node.path, newPath);
         addToast('modify', `Renamed ${node.name} to ${newName}`);
         await loadTree();
@@ -965,6 +1074,7 @@ function App() {
     try {
       const res = await fileService.deleteItem(node.path);
       if (res.success) {
+        ignoreWatcherToast(node.path, 'delete');
         await closeTabsAfterDelete(node.path);
         addToast('delete', `Deleted ${node.name}`);
         await loadTree();
@@ -1063,9 +1173,8 @@ function App() {
               }}
               onDrop={handleDropOnRoot}
               onContextMenu={(e) => handleContextMenu(e, null)}
-              className={`flex-1 overflow-auto p-3 transition-all duration-200 ${
-                draggedOverFolder === '__root__' ? 'bg-blue-500/5 border border-dashed border-blue-500/30 rounded-xl m-1' : ''
-              }`}
+              className={`flex-1 overflow-auto p-3 transition-all duration-200 ${draggedOverFolder === '__root__' ? 'bg-blue-500/5 border border-dashed border-blue-500/30 rounded-xl m-1' : ''
+                }`}
             >
               <div className="flex items-center justify-between mb-3">
                 <span className="text-xs uppercase tracking-widest text-gray-500">Explorer</span>
@@ -1103,11 +1212,10 @@ function App() {
               <div className="space-y-1 text-sm">
                 {/* Inline root creation */}
                 {creationTarget && creationTarget.parentPath === null && (
-                  <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${
-                    creationTarget.isFile 
-                      ? 'bg-blue-500/10 border border-blue-500/20' 
+                  <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${creationTarget.isFile
+                      ? 'bg-blue-500/10 border border-blue-500/20'
                       : 'bg-emerald-500/10 border border-emerald-500/20'
-                  }`}>
+                    }`}>
                     {creationTarget.isFile ? (
                       <FileText className="w-4 h-4 text-blue-400 shrink-0" />
                     ) : (
@@ -1208,11 +1316,10 @@ function App() {
                   <div
                     key={tab.path}
                     onClick={() => handleSelectTab(tab.path)}
-                    className={`group flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-all duration-150 relative ${
-                      isActive
+                    className={`group flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-all duration-150 relative ${isActive
                         ? 'bg-[#0f1117] text-white border-b-2 border-blue-500 shadow-md'
                         : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'
-                    }`}
+                      }`}
                   >
                     <FileText className={`w-3.5 h-3.5 ${isActive ? 'text-blue-400' : 'text-gray-600'}`} />
                     <span className="max-w-[120px] truncate">{tab.title}</span>
@@ -1247,11 +1354,10 @@ function App() {
                   <div className="flex bg-white/5 p-1 rounded-xl gap-1 shrink-0">
                     <button
                       onClick={() => setIsEditMode(true)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${
-                        isEditMode
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${isEditMode
                           ? 'bg-blue-600 text-white shadow-md'
                           : 'text-gray-400 hover:text-white'
-                      }`}
+                        }`}
                     >
                       <Edit3 className="w-3.5 h-3.5" />
                       <span>Edit</span>
@@ -1261,11 +1367,10 @@ function App() {
                         await saveCurrentFile();
                         setIsEditMode(false);
                       }}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${
-                        !isEditMode
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${!isEditMode
                           ? 'bg-blue-600 text-white shadow-md'
                           : 'text-gray-400 hover:text-white'
-                      }`}
+                        }`}
                     >
                       <Eye className="w-3.5 h-3.5" />
                       <span>Preview</span>
@@ -1286,16 +1391,19 @@ function App() {
 
               {/* Content Editor area */}
               {isEditMode ? (
-                <div
-                  ref={contentRef}
-                  contentEditable={!!activeFilePath}
-                  suppressContentEditableWarning={true}
-                  onBlur={handleContentBlur}
-                  className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-300 outline-none empty:before:content-[attr(data-placeholder)] empty:before:text-gray-600 empty:before:pointer-events-none select-text"
-                  data-placeholder="Start writing your thoughts here..."
-                >
-                  <p className="text-gray-500 italic">No note selected. Select a note from the file explorer on the left or create a new file to start writing.</p>
-                </div>
+                activeFilePath ? (
+                  <BlockEditor
+                    blocks={editorBlocks}
+                    onChange={(updatedBlocks) => {
+                      setEditorBlocks(updatedBlocks);
+                      saveBlocksDirectly(updatedBlocks);
+                    }}
+                  />
+                ) : (
+                  <div className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-500 italic text-left select-none">
+                    No note selected. Select a note from the file explorer on the left or create a new file to start writing.
+                  </div>
+                )
               ) : (
                 <div className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-300 select-text space-y-6">
                   {activeDocBlocks.length > 0 ? (

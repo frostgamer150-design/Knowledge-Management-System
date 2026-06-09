@@ -28,6 +28,8 @@ export interface BlockMetadata {
   lineStart: number; // 1-based start line
   lineEnd: number; // 1-based end line
   parentId?: string; // parent block ID (e.g. for nested lists)
+  childrenIds?: string[]; // IDs of nested child blocks
+  checked?: boolean; // For task list items (todo check status)
   tags: string[];
   references: string[]; // wikilinks
 }
@@ -37,6 +39,7 @@ export interface RuntimeBlock {
   type: BlockType;
   level?: number; // heading level (1, 2, 3) or list indentation depth
   content: string; // raw inner text
+  info?: string; // language for code block or callout type
   children: InlineNode[]; // parsed inline children
   metadata: BlockMetadata;
 }

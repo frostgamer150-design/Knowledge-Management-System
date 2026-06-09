@@ -7,6 +7,12 @@ import type { RuntimeBlock } from '../types/runtime-types';
 export function normalizeRuntimeBlocks(blocks: RuntimeBlock[]): RuntimeBlock[] {
   const listStack: { id: string; level: number }[] = [];
 
+  // Reset relations to build clean links
+  for (const block of blocks) {
+    block.metadata.parentId = undefined;
+    block.metadata.childrenIds = [];
+  }
+
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i];
 
@@ -20,7 +26,17 @@ export function normalizeRuntimeBlocks(blocks: RuntimeBlock[]): RuntimeBlock[] {
       }
 
       if (listStack.length > 0) {
-        block.metadata.parentId = listStack[listStack.length - 1].id;
+        const parentId = listStack[listStack.length - 1].id;
+        block.metadata.parentId = parentId;
+        
+        // Find parent and append to childrenIds
+        const parentBlock = blocks.find(b => b.id === parentId);
+        if (parentBlock) {
+          if (!parentBlock.metadata.childrenIds) {
+            parentBlock.metadata.childrenIds = [];
+          }
+          parentBlock.metadata.childrenIds.push(block.id);
+        }
       }
 
       listStack.push({ id: block.id, level });

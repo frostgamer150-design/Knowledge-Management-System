@@ -157,13 +157,15 @@ export function buildRuntimeBlocks(rawBlocks: RawBlock[], sourceFile: string): R
       type: raw.type,
       level: raw.level,
       content: raw.content,
+      info: raw.info,
       children: inlineNodes,
       metadata: {
         sourceFile,
         lineStart: raw.lineStart,
         lineEnd: raw.lineEnd,
         tags,
-        references
+        references,
+        checked: raw.checked
       }
     };
   });

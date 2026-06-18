@@ -6,12 +6,114 @@ export interface RawBlock {
   level?: number;
   info?: string; // language for code block, callout type (e.g., 'NOTE', 'WARNING') for callout
   checked?: boolean; // checklist status
+  id?: string;
 }
 
 /**
- * Parses raw Markdown text into a list of block elements with line number metadata.
+ * Parses raw Markdown text into a list of block elements with line number metadata
+ * based on comment boundaries. If no comments are found, it falls back t`o a single block.
  */
 export function parseMarkdownToRawBlocks(content: string): RawBlock[] {
+  const normalized = content.replace(/\r\n/g, '\n');
+  if (!normalized.includes('<!-- block')) {
+    return [{
+      type: 'paragraph',
+      content: content,
+      lineStart: 1,
+      lineEnd: content.split('\n').length
+    }];
+  }
+
+  const lines = normalized.split('\n');
+  const blocks: RawBlock[] = [];
+  let currentMeta: any = null;
+  let currentBlockContent: string[] = [];
+  let currentBlockStartLine = 1;
+
+  let inComment = false;
+  let accumulatedComment = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (!inComment) {
+      if (line.trim().startsWith('<!-- block')) {
+        // Push existing block content if any
+        if (currentMeta) {
+          blocks.push({
+            id: currentMeta.id,
+            type: currentMeta.type || 'paragraph',
+            content: currentBlockContent.join('\n'),
+            lineStart: currentBlockStartLine,
+            lineEnd: i,
+            level: currentMeta.level,
+            info: currentMeta.info,
+            checked: currentMeta.checked
+          });
+          currentBlockContent = [];
+        }
+
+        inComment = true;
+        accumulatedComment = line;
+      }
+    } else {
+      accumulatedComment += '\n' + line;
+    }
+
+    if (inComment) {
+      if (line.trim().endsWith('-->')) {
+        // Parse metadata from accumulated comment
+        const idMatch = accumulatedComment.match(/id="([^"]+)"/);
+        const levelMatch = accumulatedComment.match(/level="([^"]+)"/);
+        const typeMatch = accumulatedComment.match(/type="([^"]+)"/);
+        const infoMatch = accumulatedComment.match(/info="([^"]+)"/);
+        const checkedMatch = accumulatedComment.match(/checked="([^"]+)"/);
+
+        currentMeta = {
+          id: idMatch ? idMatch[1] : undefined,
+          level: levelMatch ? parseInt(levelMatch[1], 10) : 0,
+          type: typeMatch ? typeMatch[1] : 'paragraph',
+          info: infoMatch ? infoMatch[1] : undefined,
+          checked: checkedMatch ? checkedMatch[1] === 'true' : undefined
+        };
+
+        currentBlockStartLine = i + 2; // block content starts on the next line
+        inComment = false;
+        accumulatedComment = '';
+      }
+      continue;
+    }
+
+    if (currentMeta) {
+      currentBlockContent.push(line);
+    } else {
+      // Content before any block comment
+      currentMeta = { type: 'paragraph', level: 0 };
+      currentBlockStartLine = 1;
+      currentBlockContent.push(line);
+    }
+  }
+
+  if (currentMeta) {
+    blocks.push({
+      id: currentMeta.id,
+      type: currentMeta.type || 'paragraph',
+      content: currentBlockContent.join('\n'),
+      lineStart: currentBlockStartLine,
+      lineEnd: lines.length,
+      level: currentMeta.level,
+      info: currentMeta.info,
+      checked: currentMeta.checked
+    });
+  }
+
+  return blocks;
+}
+
+/**
+ * Standard markdown line-by-line parser for rendering rich previews inside individual blocks.
+ */
+export function parseStandardMarkdown(content: string): RawBlock[] {
   const lines = content.split(/\r?\n/);
   const blocks: RawBlock[] = [];
 
@@ -61,10 +163,10 @@ export function parseMarkdownToRawBlocks(content: string): RawBlock[] {
       if (idx >= lines.length - 1) return false;
       const cur = lines[idx].trim();
       const next = lines[idx + 1].trim();
-      
+
       const isDelim = next.startsWith('|') && next.endsWith('|') && /^[|:\s-]+$/.test(next);
       const isHeader = cur.startsWith('|') && cur.endsWith('|') && cur.includes('|');
-      
+
       return isHeader && isDelim;
     };
 
@@ -77,7 +179,7 @@ export function parseMarkdownToRawBlocks(content: string): RawBlock[] {
       }
       // i was advanced past the table, decrement so the loop increments correctly
       i--;
-      
+
       blocks.push({
         type: 'table',
         content: tableLines.join('\n'),
@@ -172,11 +274,11 @@ export function parseMarkdownToRawBlocks(content: string): RawBlock[] {
     const prevBlock = blocks[blocks.length - 1];
     if (prevBlock && prevBlock.type === 'list-item') {
       const indentSpaces = rawLine.match(/^\s*/)?.[0].length ?? 0;
-      if (indentSpaces >= 2 && 
-          !rawLine.match(listItemRegex) && 
-          !rawLine.match(headingRegex) && 
-          !rawLine.match(blockquoteRegex) && 
-          !trimmedLine.startsWith('```')) {
+      if (indentSpaces >= 2 &&
+        !rawLine.match(listItemRegex) &&
+        !rawLine.match(headingRegex) &&
+        !rawLine.match(blockquoteRegex) &&
+        !trimmedLine.startsWith('```')) {
         prevBlock.content += '\n' + trimmedLine;
         prevBlock.lineEnd = lineNum;
         continue;
@@ -212,73 +314,102 @@ export function parseMarkdownToRawBlocks(content: string): RawBlock[] {
 }
 
 /**
- * Serializes a list of blocks back to a single Markdown string.
+ * Serializes a list of blocks back to a single Markdown string using comments as metadata delimiters.
  */
 export function serializeBlocksToMarkdown(blocks: any[]): string {
-  const lines: string[] = [];
+  const parts: string[] = [];
 
   for (const block of blocks) {
-    const content = block.content || '';
+    const id = block.id;
     const level = block.level ?? 0;
-    const checked = block.metadata?.checked ?? block.checked;
+    const type = block.type ?? 'paragraph';
+    const info = block.info ?? '';
+    const checked = block.metadata?.checked !== undefined ? block.metadata.checked : block.checked;
 
-    switch (block.type) {
-      case 'heading': {
-        const hashtags = '#'.repeat(block.level || 1);
-        lines.push(`${hashtags} ${content}`);
-        break;
+    const metaParts = [`id="${id}"`, `level="${level}"`, `type="${type}"`];
+    if (info) metaParts.push(`info="${info}"`);
+    if (checked !== undefined) metaParts.push(`checked="${checked}"`);
+
+    parts.push(`<!-- block ${metaParts.join(' ')} -->`);
+    parts.push(block.content ?? '');
+  }
+
+  return parts.join('\n');
+}
+
+/**
+ * Parses YAML frontmatter from the top of the markdown note.
+ */
+export function parseFrontmatter(content: string): { properties: Record<string, any>; remainingContent: string } {
+  const normalized = content.replace(/\r\n/g, '\n');
+  const match = normalized.match(/^---\n([\s\S]*?)\n---\n/);
+
+  if (!match) {
+    return { properties: {}, remainingContent: content };
+  }
+
+  const frontmatterText = match[1];
+  const remainingContent = normalized.slice(match[0].length);
+  const properties: Record<string, any> = {};
+
+  const lines = frontmatterText.split('\n');
+  let currentKey = '';
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Check if it's a list item (e.g. "- tag1")
+    if (trimmed.startsWith('-') && currentKey) {
+      const val = trimmed.slice(1).trim();
+      if (!Array.isArray(properties[currentKey])) {
+        properties[currentKey] = [];
       }
-      case 'paragraph': {
-        lines.push(content);
-        break;
-      }
-      case 'list-item': {
-        const indent = '  '.repeat(level);
-        const prefix = indent + '- ' + (checked !== undefined ? (checked ? '[x] ' : '[ ] ') : '');
-        const itemLines = content.split('\n');
-        lines.push(prefix + itemLines[0]);
-        for (let j = 1; j < itemLines.length; j++) {
-          lines.push(indent + '  ' + itemLines[j]);
-        }
-        break;
-      }
-      case 'quote': {
-        const quoteLines = content.split('\n');
-        for (const line of quoteLines) {
-          lines.push(`> ${line}`);
-        }
-        break;
-      }
-      case 'callout': {
-        const calloutType = block.info || 'NOTE';
-        lines.push(`> [!${calloutType}]`);
-        const calloutLines = content.split('\n');
-        for (const line of calloutLines) {
-          lines.push(`> ${line}`);
-        }
-        break;
-      }
-      case 'code': {
-        const lang = block.info || '';
-        lines.push('```' + lang);
-        lines.push(content);
-        lines.push('```');
-        break;
-      }
-      case 'table': {
-        lines.push(content);
-        break;
-      }
-      case 'empty': {
-        lines.push('');
-        break;
-      }
-      default: {
-        lines.push(content);
-        break;
+      properties[currentKey].push(val);
+      continue;
+    }
+
+    const colonIdx = line.indexOf(':');
+    if (colonIdx !== -1) {
+      const key = line.slice(0, colonIdx).trim();
+      const val = line.slice(colonIdx + 1).trim();
+
+      currentKey = key;
+
+      if (val.startsWith('[') && val.endsWith(']')) {
+        properties[key] = val.slice(1, -1).split(',').map(s => s.trim()).filter(Boolean);
+      } else if (val) {
+        properties[key] = val;
+      } else {
+        properties[key] = []; // starts an array or empty string
       }
     }
   }
 
+  return { properties, remainingContent };
+}
+
+/**
+ * Serializes properties into YAML frontmatter.
+ */
+export function serializeFrontmatter(properties: Record<string, any>): string {
+  if (!properties || Object.keys(properties).length === 0) {
+    return '';
+  }
+
+  const lines = ['---'];
+  for (const [key, value] of Object.entries(properties)) {
+    if (Array.isArray(value)) {
+      lines.push(`${key}:`);
+      for (const val of value) {
+        lines.push(`  - ${val}`);
+      }
+    } else {
+      lines.push(`${key}: ${value}`);
+    }
+  }
+  lines.push('---');
+  lines.push(''); // add empty line after frontmatter
   return lines.join('\n');
 }
+

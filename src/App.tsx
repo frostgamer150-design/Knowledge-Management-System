@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus, Eye } from 'lucide-react';
 import { fileService } from './file_Service';
 import { vaultService } from './vault_Service';
@@ -9,9 +9,10 @@ import { SyncManager } from './runtime/sync/sync-manager';
 import { KnowledgeQueryEngine } from './runtime/graph/knowledge-query-engine';
 import { resolveLinkPath } from './runtime/graph/link-resolver';
 import { extractBlocksFromMarkdown } from './runtime/parser/block-extractor';
-import { serializeBlocksToMarkdown } from './runtime/parser/markdown-parser';
+import { serializeBlocksToMarkdown, parseFrontmatter, serializeFrontmatter } from './runtime/parser/markdown-parser';
 import type { InlineNode, RuntimeBlock } from './runtime/types/runtime-types';
 import { BlockEditor } from './components/BlockEditor';
+import { refactorLinksOnRename } from './runtime/utils/link-refactor';
 
 type ToastType = 'create-file' | 'create-folder' | 'modify' | 'delete' | 'vault';
 interface Toast {
@@ -80,9 +81,19 @@ function App() {
   }>({ visible: false, x: 0, y: 0, node: null });
 
   // Structured Knowledge Runtime UI states
-  const [isEditMode, setIsEditMode] = useState<boolean>(true);
   const [editorBlocks, setEditorBlocks] = useState<RuntimeBlock[]>([]);
+  const [noteProperties, setNoteProperties] = useState<Record<string, any>>({});
   const [scanTrigger, setScanTrigger] = useState<number>(0);
+
+  // Property addition form states
+  const [isAddingProperty, setIsAddingProperty] = useState(false);
+  const [newPropType, setNewPropType] = useState<'tags' | 'list'>('tags');
+  const [newPropKey, setNewPropKey] = useState('');
+
+  // Tag inputs and suggestion dropdown states
+  const [activeTagInputs, setActiveTagInputs] = useState<Record<string, string>>({});
+  const [focusedPropertyInputKey, setFocusedPropertyInputKey] = useState<string | null>(null);
+  const [showTagSuggestions, setShowTagSuggestions] = useState<Record<string, boolean>>({});
 
   // Drag & Drop State
   const [draggedNode, setDraggedNode] = useState<ExplorerNode | null>(null);
@@ -185,11 +196,20 @@ function App() {
 
       // Incremental sync of structured knowledge objects
       if (payload.type === 'file' && payload.path.endsWith('.md')) {
+        const normPayloadPath = payload.path.replace(/\\/g, '/');
         if (payload.event === 'create' || payload.event === 'modify') {
           try {
             const content = await fileService.readFile(payload.path);
             syncManager.handleFileChange(payload.path, content, allPaths);
             setScanTrigger(prev => prev + 1); // reactive refresh properties/backlinks
+
+            // If the modified file is the currently active file, reload the editor content
+            if (activeFilePath && normPayloadPath === activeFilePath.replace(/\\/g, '/')) {
+              const { properties, remainingContent } = parseFrontmatter(content);
+              setNoteProperties(properties);
+              const blocks = extractBlocksFromMarkdown(remainingContent, activeFilePath);
+              setEditorBlocks(blocks);
+            }
           } catch (err) {
             console.error('Failed incremental sync for file:', payload.path, err);
           }
@@ -401,8 +421,8 @@ function App() {
               onClick={() => setExpandedFolders(prev => ({ ...prev, [node.path]: !prev[node.path] }))}
               onContextMenu={(e) => handleContextMenu(e, node)}
               className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer text-gray-300 transition-all duration-150 ${isDraggedOver
-                  ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 shadow-[0_0_15px_rgba(16,185,129,0.15)] scale-[1.02]'
-                  : 'hover:bg-white/5'
+                ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 shadow-[0_0_15px_rgba(16,185,129,0.15)] scale-[1.02]'
+                : 'hover:bg-white/5'
                 }`}
             >
               {isOpen ? (
@@ -419,8 +439,8 @@ function App() {
                 {/* Inline Creation under this Folder */}
                 {creationTarget && creationTarget.parentPath === node.path && (
                   <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${creationTarget.isFile
-                      ? 'bg-blue-500/10 border border-blue-500/20'
-                      : 'bg-emerald-500/10 border border-emerald-500/20'
+                    ? 'bg-blue-500/10 border border-blue-500/20'
+                    : 'bg-emerald-500/10 border border-emerald-500/20'
                     }`}>
                     {creationTarget.isFile ? (
                       <FileText className="w-4 h-4 text-blue-400 shrink-0" />
@@ -492,9 +512,12 @@ function App() {
 
   // Helper to save current file content
   const saveCurrentFile = async () => {
-    if (activeFilePath && isEditMode && editorBlocks.length > 0) {
+    if (activeFilePath && editorBlocks.length > 0) {
       try {
-        const currentContent = serializeBlocksToMarkdown(editorBlocks);
+        const remainingContent = serializeBlocksToMarkdown(editorBlocks);
+        const frontmatter = serializeFrontmatter(noteProperties);
+        const currentContent = frontmatter + remainingContent;
+
         ignoreWatcherToast(activeFilePath, 'modify');
         await fileService.writeFile(activeFilePath, currentContent);
 
@@ -512,7 +535,10 @@ function App() {
   const saveBlocksDirectly = async (blocksToSave: RuntimeBlock[]) => {
     if (activeFilePath) {
       try {
-        const currentContent = serializeBlocksToMarkdown(blocksToSave);
+        const remainingContent = serializeBlocksToMarkdown(blocksToSave);
+        const frontmatter = serializeFrontmatter(noteProperties);
+        const currentContent = frontmatter + remainingContent;
+
         ignoreWatcherToast(activeFilePath, 'modify');
         await fileService.writeFile(activeFilePath, currentContent);
 
@@ -526,15 +552,91 @@ function App() {
     }
   };
 
-  // Sync blocks when active note changes
+  // Helper to save properties updates directly
+  const savePropertiesDirectly = async (updatedProperties: Record<string, any>) => {
+    if (activeFilePath) {
+      try {
+        const remainingContent = serializeBlocksToMarkdown(editorBlocks);
+        const frontmatter = serializeFrontmatter(updatedProperties);
+        const currentContent = frontmatter + remainingContent;
+
+        ignoreWatcherToast(activeFilePath, 'modify');
+        await fileService.writeFile(activeFilePath, currentContent);
+
+        // Sync the change in syncManager
+        const allPaths = getMdFilesFromTree(directoryTrees);
+        SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
+        setScanTrigger(prev => prev + 1);
+      } catch (err) {
+        console.error('Failed to save properties directly:', err);
+      }
+    }
+  };
+
+  const handleSaveNewProperty = () => {
+    // "tags" is the one fixed, vault-wide tag property. "list" is a generic
+    // multi-value property whose key is user-defined and unrelated to tags.
+    const key = newPropType === 'tags' ? 'tags' : newPropKey.trim();
+    if (!key || noteProperties[key]) {
+      setNewPropKey('');
+      setNewPropType('tags');
+      setIsAddingProperty(false);
+      return;
+    }
+
+    const defaultValue: any[] = [];
+    const updated = { ...noteProperties, [key]: defaultValue };
+    setNoteProperties(updated);
+    savePropertiesDirectly(updated);
+
+    setNewPropKey('');
+    setNewPropType('tags');
+    setIsAddingProperty(false);
+  };
+
+  // Generic add/remove for any list-typed property value (used by both the
+  // vault-wide "tags" property and standalone multi-value "list" properties).
+  const handleAddListValue = (key: string, newValue: string) => {
+    const trimmed = newValue.trim();
+    if (!trimmed) return;
+
+    const currentValues = Array.isArray(noteProperties[key]) ? noteProperties[key] : [];
+    if (currentValues.includes(trimmed)) {
+      setActiveTagInputs(prev => ({ ...prev, [key]: '' }));
+      return;
+    }
+
+    const updated = {
+      ...noteProperties,
+      [key]: [...currentValues, trimmed]
+    };
+    setNoteProperties(updated);
+    savePropertiesDirectly(updated);
+    setActiveTagInputs(prev => ({ ...prev, [key]: '' }));
+  };
+
+  const handleRemoveListValue = (key: string, valueToRemove: string) => {
+    const currentValues = Array.isArray(noteProperties[key]) ? noteProperties[key] : [];
+    const updated = {
+      ...noteProperties,
+      [key]: currentValues.filter((t: string) => t !== valueToRemove)
+    };
+    setNoteProperties(updated);
+    savePropertiesDirectly(updated);
+  };
+
+  // Sync blocks and properties when active note changes
   useEffect(() => {
     if (activeFilePath) {
       fileService.readFile(activeFilePath).then(content => {
-        const blocks = extractBlocksFromMarkdown(content, activeFilePath);
+        const { properties, remainingContent } = parseFrontmatter(content);
+        setNoteProperties(properties);
+        const blocks = extractBlocksFromMarkdown(remainingContent, activeFilePath);
         setEditorBlocks(blocks);
       });
     } else {
       setEditorBlocks([]);
+      setNoteProperties({});
     }
   }, [activeFilePath]);
 
@@ -653,249 +755,7 @@ function App() {
     addToast('vault', `Filtering by tag: #${tag}`);
   };
 
-  // Embed note preview viewer
-  const EmbeddedNoteView = ({ path }: { path: string }) => {
-    const allPaths = getMdFilesFromTree(directoryTrees);
-    const resolvedPath = resolveLinkPath(path, activeFilePath || '', allPaths);
-    const [content, setContent] = useState<string>('');
 
-    useEffect(() => {
-      if (resolvedPath) {
-        fileService.readFile(resolvedPath).then(setContent);
-      }
-    }, [resolvedPath]);
-
-    if (!resolvedPath) {
-      return <div className="text-xs text-red-400 italic">Target [[{path}]] not found.</div>;
-    }
-
-    const blocks = extractBlocksFromMarkdown(content, resolvedPath);
-    return (
-      <div className="space-y-2 border-l-2 border-blue-500/30 pl-4 py-1 text-sm text-gray-400 select-text">
-        {blocks.map((block) => (
-          <div key={block.id}>{renderInline(block.children)}</div>
-        ))}
-      </div>
-    );
-  };
-
-  // Render Inline children nodes
-  const renderInline = (nodes: InlineNode[]) => {
-    return nodes.map((node, idx) => {
-      switch (node.type) {
-        case 'text':
-          return <span key={idx}>{node.content}</span>;
-        case 'wikilink':
-          return (
-            <span
-              key={idx}
-              className="wikilink text-blue-400 hover:text-blue-300 underline underline-offset-4 cursor-pointer font-medium"
-              onClick={() => handleWikilinkClick(node.content)}
-            >
-              {node.raw}
-            </span>
-          );
-        case 'embed':
-          return (
-            <div key={idx} className="my-4 p-4 rounded-xl border border-white/10 bg-white/5 no-drag text-left">
-              <div className="text-[10px] text-gray-500 uppercase tracking-widest mb-2 flex items-center gap-1.5 font-bold font-sans">
-                <Link2 className="w-3 h-3" /> Embed: {node.content}
-              </div>
-              <EmbeddedNoteView path={node.content} />
-            </div>
-          );
-        case 'hashtag':
-          return (
-            <span
-              key={idx}
-              className="hashtag text-emerald-400 hover:text-emerald-300 cursor-pointer font-medium bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20 text-xs inline-block m-0.5"
-              onClick={() => handleHashtagClick(node.content)}
-            >
-              {node.raw}
-            </span>
-          );
-        case 'bold':
-          return <strong key={idx} className="font-bold text-white">{node.content}</strong>;
-        case 'italic':
-          return <em key={idx} className="italic text-gray-300">{node.content}</em>;
-        case 'code':
-          return <code key={idx} className="bg-[#1e2230] text-blue-300 px-1.5 py-0.5 rounded font-mono text-sm">{node.content}</code>;
-        default:
-          return <span key={idx}>{node.raw}</span>;
-      }
-    });
-  };
-
-  // Helper to parse tables for Preview Mode
-  const parseTableContentForPreview = (text: string) => {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    if (lines.length < 2) return [];
-    const parseRow = (row: string) => {
-      let clean = row;
-      if (clean.startsWith('|')) clean = clean.slice(1);
-      if (clean.endsWith('|')) clean = clean.slice(0, -1);
-      return clean.split('|').map(c => c.trim());
-    };
-    return [parseRow(lines[0]), ...lines.slice(2).map(parseRow)];
-  };
-
-  // Toggle checkbox state directly from Preview Mode
-  const togglePreviewCheckbox = async (blockId: string) => {
-    const updated = editorBlocks.map(b => {
-      if (b.id === blockId) {
-        return {
-          ...b,
-          metadata: {
-            ...b.metadata,
-            checked: !b.metadata?.checked
-          }
-        };
-      }
-      return b;
-    });
-    setEditorBlocks(updated);
-    await saveBlocksDirectly(updated);
-  };
-
-  // Render Structured blocks
-  const renderBlock = (block: any) => {
-    const headingClasses = [
-      '',
-      'text-4xl font-bold text-white mt-8 mb-4 border-b border-white/5 pb-2',
-      'text-2xl font-semibold text-white mt-6 mb-3',
-      'text-xl font-semibold text-gray-100 mt-4 mb-2',
-      'text-lg font-medium text-gray-200 mt-3 mb-1.5',
-      'text-md font-medium text-gray-300 mt-2 mb-1',
-      'text-sm font-medium text-gray-400 mt-2 mb-1'
-    ];
-
-    switch (block.type) {
-      case 'heading':
-        const hLevel = block.level || 1;
-        const TagName = `h${hLevel}` as any;
-        return (
-          <TagName key={block.id} className={headingClasses[hLevel]}>
-            {renderInline(block.children)}
-          </TagName>
-        );
-
-      case 'paragraph':
-        return (
-          <p key={block.id} className="mb-4 text-gray-300 leading-relaxed text-left">
-            {renderInline(block.children)}
-          </p>
-        );
-
-      case 'list-item':
-        const indentLevel = block.level || 0;
-        const indentStyle = { paddingLeft: `${indentLevel * 1.5}rem` };
-        const isTask = block.metadata?.checked !== undefined;
-
-        if (isTask) {
-          const checked = !!block.metadata.checked;
-          return (
-            <div key={block.id} style={indentStyle} className="flex items-start gap-2.5 my-1.5 text-gray-300 text-left">
-              <input
-                type="checkbox"
-                checked={checked}
-                onChange={() => togglePreviewCheckbox(block.id)}
-                className="mt-1.5 accent-blue-500 rounded cursor-pointer w-4 h-4"
-              />
-              <span className={checked ? 'line-through text-gray-500' : ''}>
-                {renderInline(block.children)}
-              </span>
-            </div>
-          );
-        }
-
-        return (
-          <div key={block.id} style={indentStyle} className="flex items-start gap-2.5 my-1.5 text-gray-300 text-left">
-            <span className="text-blue-500 mt-1 select-none font-bold text-lg leading-none">•</span>
-            <span className="flex-1">{renderInline(block.children)}</span>
-          </div>
-        );
-
-      case 'quote':
-        return (
-          <blockquote key={block.id} className="border-l-4 border-blue-500/40 bg-white/5 p-4 rounded-r-xl my-4 text-gray-400 italic text-left whitespace-pre-wrap">
-            {renderInline(block.children)}
-          </blockquote>
-        );
-
-      case 'callout':
-        const calloutType = block.info || 'NOTE';
-        let calloutColor = 'border-blue-500 bg-blue-500/5 text-blue-200';
-        let iconColor = 'text-blue-400';
-        if (calloutType === 'WARNING') {
-          calloutColor = 'border-yellow-500 bg-yellow-500/5 text-yellow-200';
-          iconColor = 'text-yellow-400';
-        } else if (calloutType === 'ERROR' || calloutType === 'DANGER') {
-          calloutColor = 'border-red-500 bg-red-500/5 text-red-200';
-          iconColor = 'text-red-400';
-        } else if (calloutType === 'SUCCESS') {
-          calloutColor = 'border-emerald-500 bg-emerald-500/5 text-emerald-200';
-          iconColor = 'text-emerald-400';
-        }
-
-        return (
-          <div key={block.id} className={`border-l-4 p-4 rounded-r-xl my-4 flex flex-col gap-1.5 text-left ${calloutColor}`}>
-            <div className="flex items-center gap-2 font-bold uppercase tracking-wider text-xs">
-              <Tag className={`w-3.5 h-3.5 ${iconColor}`} />
-              <span>{calloutType}</span>
-            </div>
-            <div className="text-sm">{renderInline(block.children)}</div>
-          </div>
-        );
-
-      case 'code':
-        return (
-          <pre key={block.id} className="bg-[#181b24] p-4 rounded-xl border border-white/5 overflow-x-auto my-4 text-sm font-mono text-gray-300 text-left select-text">
-            {block.info && (
-              <div className="text-[10px] text-gray-600 uppercase tracking-widest mb-2 font-bold font-sans">
-                {block.info}
-              </div>
-            )}
-            <code>{block.content}</code>
-          </pre>
-        );
-
-      case 'table': {
-        const grid = parseTableContentForPreview(block.content);
-        return (
-          <div key={block.id} className="my-4 overflow-x-auto border border-white/10 rounded-xl bg-white/5 p-4 text-left">
-            <table className="min-w-full border-collapse">
-              <thead>
-                <tr>
-                  {grid[0]?.map((header, colIdx) => (
-                    <th key={colIdx} className="border border-white/10 p-2 bg-[#1c1f2a] text-white font-semibold text-left">
-                      {header}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {grid.slice(1).map((row, rowIdx) => (
-                  <tr key={rowIdx}>
-                    {row.map((cell, colIdx) => (
-                      <td key={colIdx} className="border border-white/10 p-2 text-gray-300">
-                        {cell}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      }
-
-      case 'empty':
-        return <div key={block.id} className="h-4" />;
-
-      default:
-        return <div key={block.id}>{renderInline(block.children)}</div>;
-    }
-  };
 
   // Sync tabs and paths after renaming files/folders
   const updateTabsAfterRename = (oldPath: string, newPath: string) => {
@@ -1049,6 +909,10 @@ function App() {
         ignoreWatcherToast(node.path, 'delete');
         ignoreWatcherToast(newPath, 'create');
         updateTabsAfterRename(node.path, newPath);
+
+        const updatedAllPaths = allPaths.map(p => p === node.path ? newPath : p);
+        await refactorLinksOnRename(node.path, newPath, updatedAllPaths);
+
         addToast('modify', `Renamed ${node.name} to ${newName}`);
         await loadTree();
       } else {
@@ -1058,6 +922,43 @@ function App() {
       console.error(error);
     } finally {
       handleCancelRename();
+    }
+  };
+
+  const handleSaveTitleRename = async () => {
+    if (!activeFilePath) return;
+    const newTitle = activeFileTitle.trim();
+    const oldFileName = activeFilePath.split('/').pop()?.replace(/\.md$/i, '') || '';
+    
+    if (!newTitle || newTitle === oldFileName) {
+      setActiveFileTitle(oldFileName);
+      return;
+    }
+    
+    const parts = activeFilePath.split('/');
+    parts.pop();
+    const parentPath = parts.join('/');
+    const newPath = parentPath ? `${parentPath}/${newTitle}.md` : `${newTitle}.md`;
+
+    try {
+      const res = await fileService.moveItem(activeFilePath, newPath);
+      if (res.success) {
+        ignoreWatcherToast(activeFilePath, 'delete');
+        ignoreWatcherToast(newPath, 'create');
+        updateTabsAfterRename(activeFilePath, newPath);
+
+        const updatedAllPaths = allPaths.map(p => p === activeFilePath ? newPath : p);
+        await refactorLinksOnRename(activeFilePath, newPath, updatedAllPaths);
+
+        addToast('modify', `Renamed ${oldFileName} to ${newTitle}`);
+        await loadTree();
+      } else {
+        addToast('delete', `Failed to rename: ${res.error || 'Unknown error'}`);
+        setActiveFileTitle(oldFileName);
+      }
+    } catch (err) {
+      console.error(err);
+      setActiveFileTitle(oldFileName);
     }
   };
 
@@ -1108,6 +1009,34 @@ function App() {
   const allPaths = getMdFilesFromTree(directoryTrees);
   const activeDoc = useMemo(() => activeFilePath ? syncManager.getDocument(activeFilePath) : null, [activeFilePath, scanTrigger]);
   const docTags = activeDoc ? activeDoc.tags : [];
+
+  const allVaultTags = useMemo(() => {
+    const docs = syncManager.getAllDocuments();
+    const tags = new Set<string>();
+    for (const doc of docs) {
+      for (const t of doc.tags) {
+        tags.add(t);
+      }
+    }
+    return Array.from(tags);
+  }, [scanTrigger, directoryTrees]);
+
+  // Suggestions for a generic multi-list property come only from prior values
+  // used under the *same property key* across the vault - never from the tag index.
+  const getValuesForListKey = useCallback((key: string): string[] => {
+    const docs = syncManager.getAllDocuments();
+    const values = new Set<string>();
+    for (const doc of docs) {
+      const val = doc.properties?.[key];
+      if (Array.isArray(val)) {
+        for (const v of val) {
+          if (typeof v === 'string') values.add(v);
+        }
+      }
+    }
+    return Array.from(values);
+  }, [scanTrigger, directoryTrees]);
+
   const mentions = useMemo(() => activeFilePath ? queryEngine.getLinkedMentions(activeFilePath, allPaths) : [], [activeFilePath, allPaths, scanTrigger]);
   const activeDocBlocks = activeDoc ? activeDoc.blocks : [];
 
@@ -1213,8 +1142,8 @@ function App() {
                 {/* Inline root creation */}
                 {creationTarget && creationTarget.parentPath === null && (
                   <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${creationTarget.isFile
-                      ? 'bg-blue-500/10 border border-blue-500/20'
-                      : 'bg-emerald-500/10 border border-emerald-500/20'
+                    ? 'bg-blue-500/10 border border-blue-500/20'
+                    : 'bg-emerald-500/10 border border-emerald-500/20'
                     }`}>
                     {creationTarget.isFile ? (
                       <FileText className="w-4 h-4 text-blue-400 shrink-0" />
@@ -1317,8 +1246,8 @@ function App() {
                     key={tab.path}
                     onClick={() => handleSelectTab(tab.path)}
                     className={`group flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-all duration-150 relative ${isActive
-                        ? 'bg-[#0f1117] text-white border-b-2 border-blue-500 shadow-md'
-                        : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'
+                      ? 'bg-[#0f1117] text-white border-b-2 border-blue-500 shadow-md'
+                      : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'
                       }`}
                   >
                     <FileText className={`w-3.5 h-3.5 ${isActive ? 'text-blue-400' : 'text-gray-600'}`} />
@@ -1338,46 +1267,303 @@ function App() {
           {/* Editor */}
           <div className="flex-1 overflow-auto px-12 py-10">
             <div className="max-w-4xl mx-auto">
-              {/* Title & Preview Toggle Header */}
+              {/* Title Header */}
               <div className="flex justify-between items-start gap-4">
                 <input
                   type="text"
                   value={activeFileTitle}
                   onChange={(e) => setActiveFileTitle(e.target.value)}
+                  onBlur={handleSaveTitleRename}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.currentTarget.blur();
+                    } else if (e.key === 'Escape') {
+                      const oldFileName = activeFilePath?.split('/').pop()?.replace(/\.md$/i, '') || 'Untitled';
+                      setActiveFileTitle(oldFileName);
+                      e.currentTarget.blur();
+                    }
+                  }}
                   className="w-full bg-transparent outline-none text-5xl font-bold text-white placeholder-gray-600"
                   placeholder="Untitled"
                   disabled={!activeFilePath}
                 />
+              </div>
 
-                {/* Edit / Preview Mode Switcher */}
-                {activeFilePath && (
-                  <div className="flex bg-white/5 p-1 rounded-xl gap-1 shrink-0">
+              {/* Properties Editor Panel */}
+              {activeFilePath && (
+                <div className="mt-4 bg-white/5 border border-white/10 rounded-xl p-4 space-y-3">
+                  <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                    <span className="text-xs uppercase tracking-widest text-gray-400 font-semibold flex items-center gap-1.5">
+                      <Database className="w-3.5 h-3.5 text-blue-400" /> Note Properties
+                    </span>
                     <button
-                      onClick={() => setIsEditMode(true)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${isEditMode
-                          ? 'bg-blue-600 text-white shadow-md'
-                          : 'text-gray-400 hover:text-white'
-                        }`}
-                    >
-                      <Edit3 className="w-3.5 h-3.5" />
-                      <span>Edit</span>
-                    </button>
-                    <button
-                      onClick={async () => {
-                        await saveCurrentFile();
-                        setIsEditMode(false);
+                      onClick={() => {
+                        setNewPropType(noteProperties['tags'] ? 'list' : 'tags');
+                        setIsAddingProperty(true);
                       }}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border-0 outline-none cursor-pointer ${!isEditMode
-                          ? 'bg-blue-600 text-white shadow-md'
-                          : 'text-gray-400 hover:text-white'
-                        }`}
+                      className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 transition rounded text-[10px] font-semibold text-white border-0 outline-none cursor-pointer"
                     >
-                      <Eye className="w-3.5 h-3.5" />
-                      <span>Preview</span>
+                      + Add Property
                     </button>
                   </div>
-                )}
-              </div>
+                  
+                  {isAddingProperty && (
+                    <div className="flex gap-2 items-center text-xs bg-white/[0.02] border border-dashed border-white/10 rounded-xl p-2 animate-in fade-in slide-in-from-top-1">
+                      <select
+                        autoFocus
+                        value={newPropType}
+                        onChange={(e) => setNewPropType(e.target.value as 'tags' | 'list')}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Escape') {
+                            setIsAddingProperty(false);
+                            setNewPropKey('');
+                            setNewPropType('tags');
+                          }
+                        }}
+                        className="bg-[#13161d] border border-white/10 rounded px-2.5 py-1 text-gray-300 outline-none focus:border-blue-500/50 text-xs w-32"
+                      >
+                        <option value="tags" disabled={!!noteProperties['tags']}>tag</option>
+                        <option value="list">multi-list</option>
+                      </select>
+                      {newPropType === 'list' && (
+                        <input
+                          autoFocus
+                          type="text"
+                          placeholder="Property name..."
+                          value={newPropKey}
+                          onChange={(e) => setNewPropKey(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') handleSaveNewProperty();
+                            else if (e.key === 'Escape') {
+                              setIsAddingProperty(false);
+                              setNewPropKey('');
+                              setNewPropType('tags');
+                            }
+                          }}
+                          className="bg-[#13161d] border border-white/10 rounded px-2.5 py-1 text-gray-300 outline-none focus:border-blue-500/50 text-xs w-40"
+                        />
+                      )}
+                      <button
+                        onClick={handleSaveNewProperty}
+                        className="px-2.5 py-1 bg-blue-600 hover:bg-blue-500 transition rounded text-[10px] font-semibold text-white border-0 outline-none cursor-pointer"
+                      >
+                        Add
+                      </button>
+                      <button
+                        onClick={() => {
+                          setIsAddingProperty(false);
+                          setNewPropKey('');
+                          setNewPropType('tags');
+                        }}
+                        className="px-2 py-1 bg-white/5 hover:bg-white/10 transition rounded text-[10px] text-gray-400 border-0 outline-none cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+
+                  {Object.keys(noteProperties).length === 0 ? (
+                    <div className="text-xs text-gray-500 italic">No properties added yet. Click "+ Add Property" to add note metadata.</div>
+                  ) : (
+                    <div className="grid grid-cols-3 gap-2.5 items-center text-xs">
+                      {Object.entries(noteProperties).map(([key, value]) => {
+                        // "tags" is the single vault-wide tag property (feeds the tag graph).
+                        // Any other array-valued property is a standalone "list" - its values
+                        // are scoped to that property key only, never mixed with tags.
+                        let propType = 'text';
+                        if (key === 'tags') {
+                          propType = 'tag-list';
+                        } else if (Array.isArray(value)) {
+                          propType = 'list';
+                        } else if (typeof value === 'boolean') {
+                          propType = 'checkbox';
+                        } else if (typeof value === 'number') {
+                          propType = 'number';
+                        } else if (
+                          key.includes('date') ||
+                          key === 'created' ||
+                          key === 'modified' ||
+                          (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value))
+                        ) {
+                          propType = 'date';
+                        }
+
+                        return (
+                          <React.Fragment key={key}>
+                            {/* Property Name */}
+                            <div className="flex items-center justify-between text-gray-400 font-medium pr-2 border-r border-white/5 truncate" title={key}>
+                              <span className="capitalize">{key}</span>
+                              <button
+                                onClick={() => {
+                                  const confirmDelete = window.confirm(`Remove property "${key}"?`);
+                                  if (confirmDelete) {
+                                    const updated = { ...noteProperties };
+                                    delete updated[key];
+                                    setNoteProperties(updated);
+                                    savePropertiesDirectly(updated);
+                                  }
+                                }}
+                                className="text-gray-500 hover:text-red-400 transition ml-1 cursor-pointer border-0 bg-transparent text-[10px] font-bold"
+                                title="Delete Property"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                            
+                            {/* Property Value */}
+                            <div className="col-span-2 flex gap-1 items-center">
+                              {(propType === 'tag-list' || propType === 'list') ? (() => {
+                                const isTagList = propType === 'tag-list';
+                                const suggestionSource = isTagList ? allVaultTags : getValuesForListKey(key);
+                                const currentValues: string[] = Array.isArray(value) ? value : [];
+                                const filteredSuggestions = suggestionSource.filter(t => {
+                                  if (currentValues.includes(t)) return false;
+                                  const query = (activeTagInputs[key] || '').toLowerCase();
+                                  return t.toLowerCase().includes(query);
+                                });
+
+                                return (
+                                  <div className="relative flex flex-wrap gap-1 items-center w-full min-h-[32px] bg-white/5 border border-white/10 rounded px-2 py-1.5 focus-within:border-blue-500/50">
+                                    {/* Value Badges */}
+                                    {currentValues.map((item: string) => (
+                                      <span
+                                        key={item}
+                                        className={isTagList
+                                          ? "flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-[11px] font-semibold text-emerald-300"
+                                          : "flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/10 border border-white/15 text-[11px] font-semibold text-gray-300"}
+                                      >
+                                        {isTagList ? `#${item}` : item}
+                                        <button
+                                          onClick={() => handleRemoveListValue(key, item)}
+                                          className="hover:text-red-400 font-bold ml-0.5 cursor-pointer border-0 bg-transparent text-[10px] text-gray-500"
+                                        >
+                                          ✕
+                                        </button>
+                                      </span>
+                                    ))}
+
+                                    {/* Inline Input */}
+                                    <input
+                                      type="text"
+                                      placeholder={isTagList ? "+ Add tag..." : "+ Add value..."}
+                                      value={activeTagInputs[key] || ''}
+                                      onChange={(e) => {
+                                        const val = e.target.value;
+                                        setActiveTagInputs(prev => ({ ...prev, [key]: val }));
+                                        setShowTagSuggestions(prev => ({ ...prev, [key]: true }));
+                                      }}
+                                      onFocus={() => {
+                                        setFocusedPropertyInputKey(key);
+                                        setShowTagSuggestions(prev => ({ ...prev, [key]: true }));
+                                      }}
+                                      onBlur={() => {
+                                        setTimeout(() => {
+                                          const val = activeTagInputs[key];
+                                          if (val && val.trim()) {
+                                            handleAddListValue(key, val);
+                                          }
+                                          setShowTagSuggestions(prev => ({ ...prev, [key]: false }));
+                                          setFocusedPropertyInputKey(null);
+                                        }, 200);
+                                      }}
+                                      onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                          e.preventDefault();
+                                          const val = activeTagInputs[key];
+                                          if (val && val.trim()) {
+                                            handleAddListValue(key, val);
+                                          }
+                                        }
+                                      }}
+                                      className="flex-1 bg-transparent text-white outline-none min-w-[60px] text-xs border-none p-0"
+                                    />
+
+                                    {/* Dropdown suggestions */}
+                                    {focusedPropertyInputKey === key && showTagSuggestions[key] && filteredSuggestions.length > 0 && (
+                                      <div className="absolute left-0 right-0 top-full mt-1.5 z-40 bg-[#1a1d26]/95 backdrop-blur-md border border-white/10 shadow-2xl rounded-xl p-1 flex flex-col gap-0.5 max-h-40 overflow-y-auto">
+                                        {filteredSuggestions.slice(0, 5).map(suggestion => (
+                                          <div
+                                            key={suggestion}
+                                            onMouseDown={(e) => {
+                                              e.preventDefault(); // Prevents blur on input
+                                              handleAddListValue(key, suggestion);
+                                            }}
+                                            className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium cursor-pointer text-gray-300 hover:bg-white/5 hover:text-white text-left truncate"
+                                          >
+                                            {isTagList ? `#${suggestion}` : suggestion}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })() : propType === 'checkbox' ? (
+                                <input
+                                  type="checkbox"
+                                  checked={!!value}
+                                  onChange={(e) => {
+                                    const updated = {
+                                      ...noteProperties,
+                                      [key]: e.target.checked
+                                    };
+                                    setNoteProperties(updated);
+                                    savePropertiesDirectly(updated);
+                                  }}
+                                  className="w-4 h-4 rounded bg-[#13161d] border border-white/10 text-blue-600 focus:ring-0 cursor-pointer accent-blue-500"
+                                />
+                              ) : propType === 'date' ? (
+                                <input
+                                  type="date"
+                                  value={value || ''}
+                                  onChange={(e) => {
+                                    const updated = {
+                                      ...noteProperties,
+                                      [key]: e.target.value
+                                    };
+                                    setNoteProperties(updated);
+                                    savePropertiesDirectly(updated);
+                                  }}
+                                  className="bg-[#13161d] border border-white/10 rounded px-2 py-1 text-white outline-none focus:border-blue-500/50 text-xs w-full"
+                                />
+                              ) : propType === 'number' ? (
+                                <input
+                                  type="number"
+                                  value={value === undefined || value === null ? '' : value}
+                                  onChange={(e) => {
+                                    const val = e.target.value === '' ? '' : Number(e.target.value);
+                                    const updated = {
+                                      ...noteProperties,
+                                      [key]: val
+                                    };
+                                    setNoteProperties(updated);
+                                    savePropertiesDirectly(updated);
+                                  }}
+                                  className="w-full bg-[#13161d] border border-white/10 rounded px-2 py-1 text-white outline-none focus:border-blue-500/50"
+                                />
+                              ) : (
+                                <input
+                                  type="text"
+                                  placeholder={`Enter ${key}...`}
+                                  value={value || ''}
+                                  onChange={(e) => {
+                                    const updated = {
+                                      ...noteProperties,
+                                      [key]: e.target.value
+                                    };
+                                    setNoteProperties(updated);
+                                    savePropertiesDirectly(updated);
+                                  }}
+                                  className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-white outline-none focus:border-blue-500/50"
+                                />
+                              )}
+                            </div>
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Metadata */}
               <div className="flex items-center gap-4 mt-4 text-sm text-gray-500 border-b border-white/5 pb-4 mb-6">
@@ -1390,27 +1576,24 @@ function App() {
               </div>
 
               {/* Content Editor area */}
-              {isEditMode ? (
-                activeFilePath ? (
-                  <BlockEditor
-                    blocks={editorBlocks}
-                    onChange={(updatedBlocks) => {
-                      setEditorBlocks(updatedBlocks);
-                      saveBlocksDirectly(updatedBlocks);
-                    }}
-                  />
-                ) : (
-                  <div className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-500 italic text-left select-none">
-                    No note selected. Select a note from the file explorer on the left or create a new file to start writing.
-                  </div>
-                )
+              {activeFilePath ? (
+                <BlockEditor
+                  blocks={editorBlocks}
+                  onChange={(updatedBlocks) => {
+                    setEditorBlocks(updatedBlocks);
+                    saveBlocksDirectly(updatedBlocks);
+                  }}
+                  onWikilinkClick={handleWikilinkClick}
+                  onHashtagClick={handleHashtagClick}
+                  resolveLinkPath={(target) => {
+                    const allPaths = getMdFilesFromTree(directoryTrees);
+                    return resolveLinkPath(target, activeFilePath || '', allPaths);
+                  }}
+                  allPaths={allPaths}
+                />
               ) : (
-                <div className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-300 select-text space-y-6">
-                  {activeDocBlocks.length > 0 ? (
-                    activeDocBlocks.map((block) => renderBlock(block))
-                  ) : (
-                    <p className="text-gray-500 italic text-left">This document is empty.</p>
-                  )}
+                <div className="mt-6 min-h-[500px] text-[16px] leading-8 text-gray-500 italic text-left select-none">
+                  No note selected. Select a note from the file explorer on the left or create a new file to start writing.
                 </div>
               )}
             </div>

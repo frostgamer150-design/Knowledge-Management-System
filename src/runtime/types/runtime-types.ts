@@ -21,6 +21,7 @@ export interface InlineNode {
   type: InlineNodeType;
   content: string; // text content or link target
   raw: string; // raw markdown text matching this node
+  children?: InlineNode[];
 }
 
 export interface BlockMetadata {
@@ -41,6 +42,8 @@ export interface RuntimeBlock {
   content: string; // raw inner text
   info?: string; // language for code block or callout type
   children: InlineNode[]; // parsed inline children
+  parentId?: string | null;
+  childrenIds?: string[];
   metadata: BlockMetadata;
 }
 
@@ -50,6 +53,7 @@ export interface RuntimeDocument {
   blocks: RuntimeBlock[];
   tags: string[];
   references: string[]; // unique list of wikilinks in this document
+  properties: Record<string, any>; // frontmatter properties (tags, multi-list, etc.)
   wordCount: number;
   charCount: number;
 }

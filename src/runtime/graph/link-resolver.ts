@@ -29,13 +29,13 @@ export function resolveLinkPath(
   }
 
   // 3. Search for a file with the same filename in any directory (Obsidian-style fallback)
-  const targetFileName = targetWithExt.includes('/') 
-    ? targetWithExt.substring(targetWithExt.lastIndexOf('/') + 1) 
+  const targetFileName = targetWithExt.includes('/')
+    ? targetWithExt.substring(targetWithExt.lastIndexOf('/') + 1)
     : targetWithExt;
 
   for (const path of allPaths) {
-    const pathFileName = path.includes('/') 
-      ? path.substring(path.lastIndexOf('/') + 1) 
+    const pathFileName = path.includes('/')
+      ? path.substring(path.lastIndexOf('/') + 1)
       : path;
     if (pathFileName.toLowerCase() === targetFileName.toLowerCase()) {
       return path;

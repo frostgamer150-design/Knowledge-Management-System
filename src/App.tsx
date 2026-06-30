@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus, Eye } from 'lucide-react';
+import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus, Search } from 'lucide-react';
 import { fileService } from './file_Service';
 import { vaultService } from './vault_Service';
 import type { ExplorerNode, VaultInfo } from './types';
@@ -10,7 +10,7 @@ import { KnowledgeQueryEngine } from './runtime/graph/knowledge-query-engine';
 import { resolveLinkPath } from './runtime/graph/link-resolver';
 import { extractBlocksFromMarkdown } from './runtime/parser/block-extractor';
 import { serializeBlocksToMarkdown, parseFrontmatter, serializeFrontmatter } from './runtime/parser/markdown-parser';
-import type { InlineNode, RuntimeBlock } from './runtime/types/runtime-types';
+import type { RuntimeBlock } from './runtime/types/runtime-types';
 import { BlockEditor } from './components/BlockEditor';
 import { refactorLinksOnRename } from './runtime/utils/link-refactor';
 
@@ -20,6 +20,34 @@ interface Toast {
   type: ToastType;
   message: string;
 }
+
+const HighlightQueryText: React.FC<{ text: string; query: string }> = ({ text, query }) => {
+  if (!query.trim()) return <span>{text}</span>;
+
+  const terms = query.split(/\s+/).map(t => {
+    if (t.startsWith('#')) return t.slice(1);
+    return t;
+  }).filter(Boolean);
+
+  if (terms.length === 0) return <span>{text}</span>;
+
+  const escapedTerms = terms.map(t => t.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'));
+  const regex = new RegExp(`(${escapedTerms.join('|')})`, 'gi');
+  const parts = text.split(regex);
+
+  return (
+    <span>
+      {parts.map((part, i) => {
+        const isMatch = terms.some(t => t.toLowerCase() === part.toLowerCase());
+        return isMatch ? (
+          <mark key={i} className="bg-blue-500/30 text-blue-200 px-0.5 rounded font-medium">{part}</mark>
+        ) : (
+          part
+        );
+      })}
+    </span>
+  );
+};
 
 function App() {
   // Window controls
@@ -54,6 +82,13 @@ function App() {
   const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({
     'Projects': true
   });
+
+  // Sidebar Search State
+  const [activeSidebarTab, setActiveSidebarTab] = useState<'explorer' | 'search'>('explorer');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [pendingScrollToBlockId, setPendingScrollToBlockId] = useState<string | null>(null);
 
   // Editor State
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
@@ -142,16 +177,64 @@ function App() {
     const syncManager = SyncManager.getInstance();
     syncManager.handleVaultSwitch(); // reset registries & indexes
 
-    for (const filePath of mdFiles) {
-      try {
-        const content = await fileService.readFile(filePath);
-        syncManager.handleFileChange(filePath, content, mdFiles);
-      } catch (err) {
-        console.error('Failed to parse file during initial scan:', filePath, err);
+    try {
+      const { cachedStats, diskStats } = await fileService.sqliteGetFileStats();
+      const cachedDocsList = await fileService.sqliteLoadCache();
+      
+      const cachedDocsMap = new Map<string, any>();
+      for (const doc of cachedDocsList) {
+        cachedDocsMap.set(doc.path, doc);
+      }
+
+      let cachedCount = 0;
+      let scanCount = 0;
+
+      for (const filePath of mdFiles) {
+        const normPath = filePath.replace(/\\/g, '/');
+        const diskStat = diskStats[normPath];
+        const cachedStat = cachedStats[normPath];
+        const cachedDoc = cachedDocsMap.get(normPath);
+
+        if (diskStat && cachedStat && cachedDoc &&
+            diskStat.mtimeMs === cachedStat.mtimeMs &&
+            diskStat.size === cachedStat.size) {
+          syncManager.registerParsedDocument(cachedDoc, mdFiles);
+          cachedCount++;
+        } else {
+          try {
+            const content = await fileService.readFile(filePath);
+            const doc = syncManager.handleFileChange(filePath, content, mdFiles);
+            if (diskStat) {
+              await fileService.sqliteSaveDocument(doc, diskStat.mtimeMs, diskStat.size);
+            }
+            scanCount++;
+          } catch (err) {
+            console.error('Failed to parse file during initial scan:', filePath, err);
+          }
+        }
+      }
+
+      for (const cachedPath of Object.keys(cachedStats)) {
+        if (!mdFiles.includes(cachedPath)) {
+          await fileService.sqliteDeleteDocument(cachedPath);
+        }
+      }
+
+      console.log(`SQLite Hydration: Hydrated ${cachedCount} notes from cache, scanned ${scanCount} new/modified notes.`);
+      addToast('vault', `Vault loaded: ${cachedCount} from cache, ${scanCount} scanned`);
+    } catch (err) {
+      console.error('Failed SQLite database incremental scan, falling back to full scan:', err);
+      for (const filePath of mdFiles) {
+        try {
+          const content = await fileService.readFile(filePath);
+          syncManager.handleFileChange(filePath, content, mdFiles);
+        } catch (error) {
+          console.error('Failed to parse file during fallback scan:', filePath, error);
+        }
       }
     }
     setScanTrigger(prev => prev + 1);
-  }, [getMdFilesFromTree]);
+  }, [getMdFilesFromTree, addToast]);
 
   // Load Vault and directory list on mount with full vault scan
   useEffect(() => {
@@ -200,8 +283,14 @@ function App() {
         if (payload.event === 'create' || payload.event === 'modify') {
           try {
             const content = await fileService.readFile(payload.path);
-            syncManager.handleFileChange(payload.path, content, allPaths);
+            const doc = syncManager.handleFileChange(payload.path, content, allPaths);
             setScanTrigger(prev => prev + 1); // reactive refresh properties/backlinks
+
+            // Persist to SQLite cache
+            const stat = await fileService.sqliteGetSingleFileStat(payload.path);
+            if (stat) {
+              await fileService.sqliteSaveDocument(doc, stat.mtimeMs, stat.size);
+            }
 
             // If the modified file is the currently active file, reload the editor content
             if (activeFilePath && normPayloadPath === activeFilePath.replace(/\\/g, '/')) {
@@ -215,6 +304,7 @@ function App() {
           }
         } else if (payload.event === 'delete') {
           syncManager.handleFileDelete(payload.path, allPaths);
+          await fileService.sqliteDeleteDocument(payload.path);
           setScanTrigger(prev => prev + 1); // reactive refresh
         }
       }
@@ -523,8 +613,13 @@ function App() {
 
         // Sync the change in syncManager
         const allPaths = getMdFilesFromTree(directoryTrees);
-        SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
+        const doc = SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
         setScanTrigger(prev => prev + 1);
+
+        const stat = await fileService.sqliteGetSingleFileStat(activeFilePath);
+        if (stat) {
+          await fileService.sqliteSaveDocument(doc, stat.mtimeMs, stat.size);
+        }
       } catch (err) {
         console.error('Failed to save current file:', err);
       }
@@ -544,8 +639,13 @@ function App() {
 
         // Sync the change in syncManager
         const allPaths = getMdFilesFromTree(directoryTrees);
-        SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
+        const doc = SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
         setScanTrigger(prev => prev + 1);
+
+        const stat = await fileService.sqliteGetSingleFileStat(activeFilePath);
+        if (stat) {
+          await fileService.sqliteSaveDocument(doc, stat.mtimeMs, stat.size);
+        }
       } catch (err) {
         console.error('Failed to save blocks directly:', err);
       }
@@ -565,8 +665,13 @@ function App() {
 
         // Sync the change in syncManager
         const allPaths = getMdFilesFromTree(directoryTrees);
-        SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
+        const doc = SyncManager.getInstance().handleFileChange(activeFilePath, currentContent, allPaths);
         setScanTrigger(prev => prev + 1);
+
+        const stat = await fileService.sqliteGetSingleFileStat(activeFilePath);
+        if (stat) {
+          await fileService.sqliteSaveDocument(doc, stat.mtimeMs, stat.size);
+        }
       } catch (err) {
         console.error('Failed to save properties directly:', err);
       }
@@ -639,6 +744,54 @@ function App() {
       setNoteProperties({});
     }
   }, [activeFilePath]);
+
+  // Database-driven Search Query Execution with Debounce
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    const delayDebounce = setTimeout(async () => {
+      try {
+        const results = await fileService.sqliteSearchNotes(q);
+        setSearchResults(results);
+      } catch (err) {
+        console.error("Failed executing SQLite notes search:", err);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 250);
+
+    return () => clearTimeout(delayDebounce);
+  }, [searchQuery, scanTrigger]);
+
+  // Handle navigation and scrolling to specific block
+  const handleSelectBlock = async (filePath: string, blockId: string) => {
+    await handleSelectFile(filePath);
+    setPendingScrollToBlockId(blockId);
+  };
+
+  useEffect(() => {
+    if (activeFilePath && pendingScrollToBlockId) {
+      const timer = setTimeout(() => {
+        const element = document.getElementById(pendingScrollToBlockId);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          // Highlight block element visually
+          element.classList.add('bg-blue-500/10', 'border-blue-500/30');
+          setTimeout(() => {
+            element.classList.remove('bg-blue-500/10', 'border-blue-500/30');
+          }, 2000);
+        }
+        setPendingScrollToBlockId(null);
+      }, 350); // 350ms to ensure component mounts and renders blocks
+      return () => clearTimeout(timer);
+    }
+  }, [activeFilePath, pendingScrollToBlockId]);
 
   // Selecting a file with Preview & Ctrl+Click rules
   const handleSelectFile = async (path: string, isCtrlClick = false) => {
@@ -752,7 +905,8 @@ function App() {
   };
 
   const handleHashtagClick = (tag: string) => {
-    addToast('vault', `Filtering by tag: #${tag}`);
+    setActiveSidebarTab('search');
+    setSearchQuery(`#${tag}`);
   };
 
 
@@ -987,10 +1141,7 @@ function App() {
     }
   };
 
-  // Save content on editing exit (blur)
-  const handleContentBlur = async () => {
-    await saveCurrentFile();
-  };
+
 
 
 
@@ -1038,7 +1189,7 @@ function App() {
   }, [scanTrigger, directoryTrees]);
 
   const mentions = useMemo(() => activeFilePath ? queryEngine.getLinkedMentions(activeFilePath, allPaths) : [], [activeFilePath, allPaths, scanTrigger]);
-  const activeDocBlocks = activeDoc ? activeDoc.blocks : [];
+
 
   return (
     <div className="w-screen h-screen flex flex-col bg-[#0f1117] text-gray-200 font-sans select-none">
@@ -1094,79 +1245,254 @@ function App() {
               Loading Vault...
             </div>
           ) : vaultInfo?.vaultPath ? (
-            /* Explorer */
-            <div
-              onDragOver={handleDragOverRoot}
-              onDragLeave={() => {
-                if (draggedOverFolder === '__root__') setDraggedOverFolder(null);
-              }}
-              onDrop={handleDropOnRoot}
-              onContextMenu={(e) => handleContextMenu(e, null)}
-              className={`flex-1 overflow-auto p-3 transition-all duration-200 ${draggedOverFolder === '__root__' ? 'bg-blue-500/5 border border-dashed border-blue-500/30 rounded-xl m-1' : ''
-                }`}
-            >
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-xs uppercase tracking-widest text-gray-500">Explorer</span>
+            <div className="flex-1 flex flex-col min-h-0">
+              {/* Tab Selector */}
+              <div className="flex border-b border-white/5 shrink-0 select-none">
                 <button
-                  onClick={loadTree}
-                  className="text-gray-500 hover:text-white transition cursor-pointer border-0 outline-none"
-                  title="Refresh Explorer"
+                  onClick={() => setActiveSidebarTab('explorer')}
+                  className={`flex-1 py-3 text-xs font-semibold uppercase tracking-wider transition border-b-2 outline-none cursor-pointer text-center ${
+                    activeSidebarTab === 'explorer'
+                      ? 'border-blue-500 text-white bg-white/[0.02]'
+                      : 'border-transparent text-gray-500 hover:text-gray-300'
+                  }`}
                 >
-                  <RotateCw className="w-3.5 h-3.5" />
+                  Explorer
+                </button>
+                <button
+                  onClick={() => setActiveSidebarTab('search')}
+                  className={`flex-1 py-3 text-xs font-semibold uppercase tracking-wider transition border-b-2 outline-none cursor-pointer text-center ${
+                    activeSidebarTab === 'search'
+                      ? 'border-blue-500 text-white bg-white/[0.02]'
+                      : 'border-transparent text-gray-500 hover:text-gray-300'
+                  }`}
+                >
+                  Search
                 </button>
               </div>
 
-              {/* Create file/folder buttons */}
-              <div className="flex items-center justify-center mb-3 gap-4 bg-white/5 py-1.5 rounded-lg">
-                <button
-                  className="text-gray-400 hover:text-white transition cursor-pointer border-0 outline-none flex items-center gap-1.5 text-xs font-medium"
-                  onClick={handleCreateFile}
-                  title="Create File"
+              {activeSidebarTab === 'explorer' ? (
+                /* Explorer */
+                <div
+                  onDragOver={handleDragOverRoot}
+                  onDragLeave={() => {
+                    if (draggedOverFolder === '__root__') setDraggedOverFolder(null);
+                  }}
+                  onDrop={handleDropOnRoot}
+                  onContextMenu={(e) => handleContextMenu(e, null)}
+                  className={`flex-1 overflow-auto p-3 transition-all duration-200 ${draggedOverFolder === '__root__' ? 'bg-blue-500/5 border border-dashed border-blue-500/30 rounded-xl m-1' : ''
+                    }`}
                 >
-                  <File className="w-4 h-4" />
-                  <span>New File</span>
-                </button>
-                <div className="w-px h-3 bg-white/10" />
-                <button
-                  className="text-gray-400 hover:text-white transition cursor-pointer border-0 outline-none flex items-center gap-1.5 text-xs font-medium"
-                  onClick={handleCreateFolder}
-                  title="Create Folder"
-                >
-                  <Folder className="w-4 h-4" />
-                  <span>New Folder</span>
-                </button>
-              </div>
-
-              {/* Dynamic Tree Directory */}
-              <div className="space-y-1 text-sm">
-                {/* Inline root creation */}
-                {creationTarget && creationTarget.parentPath === null && (
-                  <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${creationTarget.isFile
-                    ? 'bg-blue-500/10 border border-blue-500/20'
-                    : 'bg-emerald-500/10 border border-emerald-500/20'
-                    }`}>
-                    {creationTarget.isFile ? (
-                      <FileText className="w-4 h-4 text-blue-400 shrink-0" />
-                    ) : (
-                      <Folder className="w-4 h-4 text-emerald-400 shrink-0" />
-                    )}
-                    <input
-                      autoFocus
-                      type="text"
-                      placeholder={creationTarget.isFile ? "note-name.md" : "Folder name"}
-                      value={newItemName}
-                      onChange={(e) => setNewItemName(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') handleSaveNewItem();
-                        else if (e.key === 'Escape') handleCancelNewItem();
-                      }}
-                      onBlur={handleSaveNewItem}
-                      className="bg-transparent outline-none text-white text-xs w-full"
-                    />
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs uppercase tracking-widest text-gray-500">Explorer</span>
+                    <button
+                      onClick={loadTree}
+                      className="text-gray-500 hover:text-white transition cursor-pointer border-0 outline-none"
+                      title="Refresh Explorer"
+                    >
+                      <RotateCw className="w-3.5 h-3.5" />
+                    </button>
                   </div>
-                )}
-                {renderTree(directoryTrees)}
-              </div>
+
+                  {/* Create file/folder buttons */}
+                  <div className="flex items-center justify-center mb-3 gap-4 bg-white/5 py-1.5 rounded-lg">
+                    <button
+                      className="text-gray-400 hover:text-white transition cursor-pointer border-0 outline-none flex items-center gap-1.5 text-xs font-medium"
+                      onClick={handleCreateFile}
+                      title="Create File"
+                    >
+                      <File className="w-4 h-4" />
+                      <span>New File</span>
+                    </button>
+                    <div className="w-px h-3 bg-white/10" />
+                    <button
+                      className="text-gray-400 hover:text-white transition cursor-pointer border-0 outline-none flex items-center gap-1.5 text-xs font-medium"
+                      onClick={handleCreateFolder}
+                      title="Create Folder"
+                    >
+                      <Folder className="w-4 h-4" />
+                      <span>New Folder</span>
+                    </button>
+                  </div>
+
+                  {/* Dynamic Tree Directory */}
+                  <div className="space-y-1 text-sm">
+                    {/* Inline root creation */}
+                    {creationTarget && creationTarget.parentPath === null && (
+                      <div className={`flex items-center gap-2 px-2 py-1.5 rounded-lg ${creationTarget.isFile
+                        ? 'bg-blue-500/10 border border-blue-500/20'
+                        : 'bg-emerald-500/10 border border-emerald-500/20'
+                        }`}>
+                        {creationTarget.isFile ? (
+                          <FileText className="w-4 h-4 text-blue-400 shrink-0" />
+                        ) : (
+                          <Folder className="w-4 h-4 text-emerald-400 shrink-0" />
+                        )}
+                        <input
+                          autoFocus
+                          type="text"
+                          placeholder={creationTarget.isFile ? "note-name.md" : "Folder name"}
+                          value={newItemName}
+                          onChange={(e) => setNewItemName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') handleSaveNewItem();
+                            else if (e.key === 'Escape') handleCancelNewItem();
+                          }}
+                          onBlur={handleSaveNewItem}
+                          className="bg-transparent outline-none text-white text-xs w-full"
+                        />
+                      </div>
+                    )}
+                    {renderTree(directoryTrees)}
+                  </div>
+                </div>
+              ) : (
+                /* Search Tab UI */
+                <div className="flex-1 flex flex-col p-3 overflow-hidden">
+                  {/* Search Input Box */}
+                  <div className="relative flex items-center bg-white/5 border border-white/10 rounded-xl px-3 py-2 focus-within:border-blue-500/50 transition">
+                    <Search className="w-4 h-4 text-gray-500 shrink-0 mr-2" />
+                    <input
+                      type="text"
+                      placeholder="Search notes, blocks, tags..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="bg-transparent text-xs text-white outline-none w-full pr-6"
+                    />
+                    {searchQuery && (
+                      <button
+                        onClick={() => setSearchQuery('')}
+                        className="absolute right-2 text-gray-500 hover:text-white p-0.5 border-0 bg-transparent cursor-pointer outline-none"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* All Vault Tags list (Quick tag filter) */}
+                  {allVaultTags.length > 0 && (
+                    <div className="mt-3 shrink-0">
+                      <div className="text-[10px] uppercase tracking-widest text-gray-500 font-semibold mb-1.5 flex items-center gap-1">
+                        <Tag className="w-3 h-3" /> Quick Tag Filter
+                      </div>
+                      <div className="flex flex-wrap gap-1 max-h-20 overflow-y-auto pb-1">
+                        {allVaultTags.map(tag => {
+                          const isSelected = searchQuery.includes(`#${tag}`);
+                          return (
+                            <span
+                              key={tag}
+                              onClick={() => {
+                                if (isSelected) {
+                                  setSearchQuery(prev => prev.replace(`#${tag}`, '').trim());
+                                } else {
+                                  setSearchQuery(prev => `${prev} #${tag}`.trim());
+                                }
+                              }}
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-medium cursor-pointer transition select-none ${
+                                isSelected
+                                  ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300'
+                                  : 'bg-white/5 border border-white/10 text-gray-400 hover:bg-white/10 hover:text-white'
+                              }`}
+                            >
+                              #{tag}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Results list */}
+                  <div className="flex-1 overflow-y-auto mt-4 space-y-3.5 pr-0.5">
+                    {isSearching ? (
+                      <div className="text-center py-6 text-xs text-gray-500 flex items-center justify-center gap-1.5">
+                        <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Searching SQLite database...</span>
+                      </div>
+                    ) : searchResults.length > 0 ? (
+                      searchResults.map((result) => {
+                        const noteTitle = result.title;
+                        const matchCount = result.matchingBlocks?.length || 0;
+
+                        return (
+                          <div key={result.path} className="space-y-1 bg-white/[0.01] hover:bg-white/[0.02] border border-white/5 rounded-xl p-2.5 transition">
+                            {/* Note Title Link */}
+                            <div
+                              onClick={() => handleSelectFile(result.path)}
+                              className="flex items-center justify-between text-xs font-semibold text-white cursor-pointer group/title"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <FileText className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                                <span className="truncate group-hover/title:text-blue-300 transition" title={result.path}>
+                                  {noteTitle}
+                                </span>
+                              </div>
+                              {matchCount > 0 && (
+                                <span className="px-1.5 py-0.5 rounded-md bg-blue-500/10 text-[9px] text-blue-400 font-bold shrink-0">
+                                  {matchCount}
+                                </span>
+                              )}
+                            </div>
+                            
+                            {/* Note Tags (if any) */}
+                            {result.tags && result.tags.length > 0 && (
+                              <div className="flex flex-wrap gap-1 mt-1 pl-5.5">
+                                {result.tags.map((t: string) => (
+                                  <span key={t} className="text-[9px] text-emerald-400/80 font-mono">
+                                    #{t}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Nested Matching Blocks */}
+                            {matchCount > 0 && (
+                              <div className="mt-2 pl-4 border-l border-white/5 space-y-2">
+                                {result.matchingBlocks.map((block: any) => (
+                                  <div
+                                    key={block.id}
+                                    onClick={() => handleSelectBlock(result.path, block.id)}
+                                    className="p-1.5 rounded-lg bg-[#181b24]/50 hover:bg-[#1e2230] cursor-pointer transition text-[11px] text-gray-400 hover:text-white text-left font-sans select-none border border-transparent hover:border-white/5"
+                                  >
+                                    <div className="text-[9px] text-gray-600 font-mono flex items-center justify-between mb-0.5">
+                                      <span className="capitalize">{block.type}</span>
+                                      <span>Line {block.metadata.lineStart}</span>
+                                    </div>
+                                    <div className="truncate italic">
+                                      <HighlightQueryText text={block.content || ''} query={searchQuery} />
+                                    </div>
+                                    {/* Block-level tags */}
+                                    {block.metadata.tags && block.metadata.tags.length > 0 && (
+                                      <div className="flex flex-wrap gap-1 mt-1">
+                                        {block.metadata.tags.map((t: string) => (
+                                          <span key={t} className="px-1.5 py-0.2 bg-emerald-500/10 border border-emerald-500/20 text-[8px] text-emerald-400 rounded-full font-mono font-semibold">
+                                            #{t}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                    ) : searchQuery.trim() ? (
+                      <div className="text-center py-6 text-xs text-gray-500">
+                        No matches found.
+                      </div>
+                    ) : (
+                      <div className="text-center py-8 text-xs text-gray-500 flex flex-col items-center justify-center gap-2">
+                        <Search className="w-8 h-8 text-gray-600 mb-1" />
+                        <p className="font-semibold text-gray-400">Search Vault</p>
+                        <p className="text-[10px] text-gray-500 max-w-[200px] leading-relaxed mx-auto">
+                          Enter keywords or tags (e.g. <span className="text-blue-400">#notes</span>) to query the database.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             /* Open Vault display replacing renderTree */

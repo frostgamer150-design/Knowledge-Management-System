@@ -310,9 +310,9 @@ const RenderParsedBlock: React.FC<{
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row, rIdx) => (
+                {rows.map((row: string[], rIdx: number) => (
                   <tr key={rIdx}>
-                    {row.map((cell, colIdx) => (
+                    {row.map((cell: string, colIdx: number) => (
                       <td key={colIdx} className="border border-white/10 p-2 text-gray-300">
                         {cell}
                       </td>
@@ -429,7 +429,7 @@ export const BlockEditor: React.FC<BlockEditorProps> = ({
     return matches.slice(0, 8);
   }, [allPaths, autocompleteQuery]);
 
-  const checkAutocompleteTrigger = (block: RuntimeBlock, blockIdx: number) => {
+  const checkAutocompleteTrigger = () => {
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0) {
       setShowAutocomplete(false);
@@ -1067,6 +1067,7 @@ export const BlockEditor: React.FC<BlockEditorProps> = ({
 
         return (
           <div
+            id={block.id}
             key={block.id}
             style={blockStyle}
             onDragOver={(e) => handleDragOver(e, block.id)}
@@ -1150,8 +1151,8 @@ export const BlockEditor: React.FC<BlockEditorProps> = ({
                       setShowAutocomplete(false);
                     }}
                     onKeyDown={(e) => handleKeyDown(e, block, idx)}
-                    onInput={() => checkAutocompleteTrigger(block, idx)}
-                    onKeyUp={() => checkAutocompleteTrigger(block, idx)}
+                    onInput={() => checkAutocompleteTrigger()}
+                    onKeyUp={() => checkAutocompleteTrigger()}
                     style={{ whiteSpace: 'pre-wrap' }}
                     className={`outline-none leading-7 text-[16px] empty:before:content-[attr(data-placeholder)] empty:before:text-gray-600 empty:before:pointer-events-none select-text ${textStyle} ${block.metadata.checked ? 'line-through text-gray-500' : ''
                       }`}

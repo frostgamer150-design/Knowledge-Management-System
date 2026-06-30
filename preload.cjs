@@ -19,6 +19,14 @@ contextBridge.exposeInMainWorld('electron', {
   moveItem: (oldRelativePath, newRelativePath) => ipcRenderer.invoke('move-item', oldRelativePath, newRelativePath),
   deleteItem: (relativePath) => ipcRenderer.invoke('delete-item', relativePath),
 
+  // SQLite DB Cache operations
+  sqliteGetFileStats: () => ipcRenderer.invoke('sqlite-get-file-stats'),
+  sqliteLoadCache: () => ipcRenderer.invoke('sqlite-load-cache'),
+  sqliteSaveDocument: (doc, mtimeMs, size) => ipcRenderer.invoke('sqlite-save-document', doc, mtimeMs, size),
+  sqliteDeleteDocument: (path) => ipcRenderer.invoke('sqlite-delete-document', path),
+  sqliteGetSingleFileStat: (path) => ipcRenderer.invoke('sqlite-get-single-file-stat', path),
+  sqliteSearchNotes: (queryText) => ipcRenderer.invoke('sqlite-search-notes', queryText),
+
   // File & vault watchers
   startFileWatch: (vaultPath) => ipcRenderer.invoke('on-file-folder-watch', vaultPath),
   onVaultTreeChanged: (callback) => ipcRenderer.on('vault-tree-changed', (_e, payload) => callback(payload)),

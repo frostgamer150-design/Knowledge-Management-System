@@ -132,6 +132,21 @@ export class SyncManager {
   }
 
   /**
+   * Directly registers a pre-parsed/pre-cached document.
+   * Skips file read and markdown parsing, synchronizing to registry & graph.
+   */
+  public registerParsedDocument(doc: RuntimeDocument, allPaths: string[]): void {
+    const normalizedPath = doc.path.replace(/\\/g, '/');
+    const oldDoc = this.documents.get(normalizedPath) || null;
+    
+    // Update local cache
+    this.documents.set(normalizedPath, doc);
+
+    // Sync to registries, graph indexes, etc.
+    syncDocumentRuntime(normalizedPath, oldDoc, doc, allPaths);
+  }
+
+  /**
    * Fetches a cached document.
    */
   public getDocument(filePath: string): RuntimeDocument | undefined {

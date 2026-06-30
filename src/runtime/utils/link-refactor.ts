@@ -19,7 +19,6 @@ export async function refactorLinksOnRename(
   const backlinks = RelationshipIndex.getInstance().getBacklinks(normOldPath);
   if (backlinks.length === 0) return;
 
-  const oldFileName = normOldPath.split('/').pop()?.replace(/\.md$/i, '') || '';
   const newFileName = normNewPath.split('/').pop()?.replace(/\.md$/i, '') || '';
 
   for (const refPath of backlinks) {

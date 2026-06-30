@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { startVaultWatch, handleVaultChange } = require('./vault_watcher.cjs');
+const dbService = require('./database_service.cjs');
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
@@ -62,6 +63,7 @@ function ensureVaultExists(vPath) {
 }
 
 ensureVaultExists(vaultPath);
+dbService.initDatabase(vaultPath).catch(err => console.error('Failed to initialize SQLite database:', err));
 
 /** @typedef {import('./src/types').ExplorerNode} ExplorerNode */
 /** @typedef {import('./src/types').FolderNode} FolderNode */
@@ -78,6 +80,8 @@ function readDirectoryRecursive(dirPath, relativeDir = '') {
   const files = fs.readdirSync(dirPath, { withFileTypes: true });
 
   for (const file of files) {
+    if (file.name.startsWith('.')) continue;
+
     const fileRelativePath = relativeDir ? path.join(relativeDir, file.name) : file.name;
     const fileAbsolutePath = path.join(dirPath, file.name);
 
@@ -145,6 +149,7 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  dbService.closeDatabase();
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -194,16 +199,18 @@ ipcMain.handle('select-vault-dir', async () => {
   store.set('lastOpened', new Date().toISOString());
   store.set('name', path.basename(selectedPath));
   ensureVaultExists(selectedPath);
+  await dbService.initDatabase(selectedPath); // Re-initialize database
   handleVaultChange(selectedPath, mainWindow);
   return selectedPath;
 });
 
-ipcMain.handle('set-vault-path', (event, newPath) => {
+ipcMain.handle('set-vault-path', async (event, newPath) => {
   vaultPath = newPath;
   store.set('vaultPath', newPath);
   store.set('lastOpened', new Date().toISOString());
   store.set('name', path.basename(newPath));
   ensureVaultExists(newPath);
+  await dbService.initDatabase(newPath); // Re-initialize database
   handleVaultChange(newPath, mainWindow);
   return true;
 });
@@ -332,5 +339,89 @@ ipcMain.handle('delete-item', (event, relativePath) => {
   } catch (err) {
     console.error(err);
     return { success: false, error: err.message };
+  }
+});
+
+// SQLite IPC Operations
+ipcMain.handle('sqlite-get-file-stats', async () => {
+  try {
+    const cachedStats = dbService.getStoredFileStats();
+    const diskStats = {};
+
+    const scanDir = (dirPath, relativeDir = '') => {
+      if (!fs.existsSync(dirPath)) return;
+      const files = fs.readdirSync(dirPath, { withFileTypes: true });
+      for (const file of files) {
+        const relPath = relativeDir ? `${relativeDir}/${file.name}` : file.name;
+        const absPath = path.join(dirPath, file.name);
+        if (file.isDirectory()) {
+          if (file.name.startsWith('.')) continue; // ignore .module-test, .git, etc.
+          scanDir(absPath, relPath);
+        } else if (file.name.endsWith('.md')) {
+          const stat = fs.statSync(absPath);
+          diskStats[relPath] = {
+            mtimeMs: stat.mtimeMs,
+            size: stat.size
+          };
+        }
+      }
+    };
+    scanDir(vaultPath);
+
+    return { cachedStats, diskStats };
+  } catch (err) {
+    console.error("Error in sqlite-get-file-stats IPC:", err);
+    return { cachedStats: {}, diskStats: {} };
+  }
+});
+
+ipcMain.handle('sqlite-load-cache', async () => {
+  try {
+    return dbService.loadCachedDocuments();
+  } catch (err) {
+    console.error("Error in sqlite-load-cache IPC:", err);
+    return [];
+  }
+});
+
+ipcMain.handle('sqlite-save-document', async (event, doc, mtimeMs, size) => {
+  try {
+    dbService.saveDocument(doc, mtimeMs, size);
+    return true;
+  } catch (err) {
+    console.error("Error in sqlite-save-document IPC:", err);
+    return false;
+  }
+});
+
+ipcMain.handle('sqlite-delete-document', async (event, filePath) => {
+  try {
+    dbService.deleteDocument(filePath);
+    return true;
+  } catch (err) {
+    console.error("Error in sqlite-delete-document IPC:", err);
+    return false;
+  }
+});
+
+ipcMain.handle('sqlite-get-single-file-stat', async (event, relativePath) => {
+  try {
+    const absolutePath = path.join(vaultPath, relativePath);
+    if (fs.existsSync(absolutePath)) {
+      const stat = fs.statSync(absolutePath);
+      return { mtimeMs: stat.mtimeMs, size: stat.size };
+    }
+  } catch (err) {
+    console.error("Error in sqlite-get-single-file-stat IPC:", err);
+  }
+  return null;
+});
+
+ipcMain.handle('sqlite-search-notes', async (event, queryText) => {
+  try {
+    return dbService.searchNotesAndBlocks(queryText);
+  } catch (err) {
+    console.error("Error in sqlite-search-notes IPC:", err);
+    return [];
   }
 });

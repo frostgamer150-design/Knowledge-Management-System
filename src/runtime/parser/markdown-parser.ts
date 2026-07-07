@@ -331,7 +331,17 @@ export function serializeBlocksToMarkdown(blocks: any[]): string {
     if (checked !== undefined) metaParts.push(`checked="${checked}"`);
 
     parts.push(`<!-- block ${metaParts.join(' ')} -->`);
-    parts.push(block.content ?? '');
+    let content = block.content ?? '';
+    if (type === 'code' && !content.startsWith('```')) {
+      content = `\`\`\`${info}\n${content}\n\`\`\``;
+    } else if (type === 'list-item') {
+      const cleanContent = content.replace(/^\s*[-*+]\s*(\[[ xX]\]\s*)?/, '');
+      const indent = '  '.repeat(level);
+      const prefix = indent + '- ' + (checked !== undefined ? (checked ? '[x] ' : '[ ] ') : '');
+      content = prefix + cleanContent;
+    }
+
+    parts.push(content);
   }
 
   return parts.join('\n');

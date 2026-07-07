@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('electron', {
   getVaultInfo: () => ipcRenderer.invoke('get-vault-info'),
   selectVaultDir: () => ipcRenderer.invoke('select-vault-dir'),
   setVaultPath: (path) => ipcRenderer.invoke('set-vault-path', path),
+  clearVault: () => ipcRenderer.invoke('clear-vault'),
 
   // Vault File operations
   getVaultTree: () => ipcRenderer.invoke('get-vault-tree'),

@@ -17,7 +17,7 @@ export function normalizeRuntimeBlocks(blocks: RuntimeBlock[]): RuntimeBlock[] {
 
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i];
-    const level = block.level ?? 0;
+    const level = block.type === 'list-item' ? (block.level ?? 0) : 0;
 
     // Pop from stack until we find a parent block with a lower indentation level
     while (stack.length > 0 && stack[stack.length - 1].level >= level) {

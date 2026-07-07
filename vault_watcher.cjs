@@ -1,12 +1,16 @@
 const { startFileWatch, stopFileWatch } = require('./file_watcher.cjs');
 
 function startVaultWatch(vaultPath, mainWindow) {
-  startFileWatch(vaultPath, mainWindow);
+  if (vaultPath) {
+    startFileWatch(vaultPath, mainWindow);
+  }
 }
 
 function handleVaultChange(newVaultPath, mainWindow) {
   stopFileWatch();
-  startFileWatch(newVaultPath, mainWindow);
+  if (newVaultPath) {
+    startFileWatch(newVaultPath, mainWindow);
+  }
   mainWindow?.webContents.send('vault-changed', { path: newVaultPath });
 }
 

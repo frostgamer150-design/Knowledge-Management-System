@@ -30,6 +30,15 @@ class ElectronStore {
     }
   }
 
+  clear() {
+    this.data = {};
+    try {
+      fs.writeFileSync(this.path, JSON.stringify(this.data, null, 2));
+    } catch (err) {
+      console.error('Failed to clear config in AppData:', err);
+    }
+  }
+
   parseDataFile(filePath) {
     try {
       if (fs.existsSync(filePath)) {
@@ -44,11 +53,12 @@ class ElectronStore {
 
 const store = new ElectronStore();
 
-// Load the dynamic vaultPath from AppData store, fallback to default local folder
-let vaultPath = store.get('vaultPath') || path.join(__dirname, 'vault');
+// Load the dynamic vaultPath from AppData store, fallback to empty string if none is saved
+let vaultPath = store.get('vaultPath') || '';
 
 // Helper to ensure path exists and populate it with initial welcome files if it is a new folder
 function ensureVaultExists(vPath) {
+  if (!vPath) return;
   if (!fs.existsSync(vPath)) {
     fs.mkdirSync(vPath, { recursive: true });
     fs.writeFileSync(path.join(vPath, 'README.md'), '# Welcome to Vault Workspace 🚀\n\nThis is a markdown notes editor.');
@@ -62,8 +72,10 @@ function ensureVaultExists(vPath) {
   }
 }
 
-ensureVaultExists(vaultPath);
-dbService.initDatabase(vaultPath).catch(err => console.error('Failed to initialize SQLite database:', err));
+if (vaultPath) {
+  ensureVaultExists(vaultPath);
+  dbService.initDatabase(vaultPath).catch(err => console.error('Failed to initialize SQLite database:', err));
+}
 
 /** @typedef {import('./src/types').ExplorerNode} ExplorerNode */
 /** @typedef {import('./src/types').FolderNode} FolderNode */
@@ -93,11 +105,13 @@ function readDirectoryRecursive(dirPath, relativeDir = '') {
         children: readDirectoryRecursive(fileAbsolutePath, fileRelativePath),
       });
     } else {
-      result.push({
-        name: file.name,
-        path: fileRelativePath.replace(/\\/g, '/'),
-        isFolder: false,
-      });
+      if (file.name.toLowerCase().endsWith('.md')) {
+        result.push({
+          name: file.name,
+          path: fileRelativePath.replace(/\\/g, '/'),
+          isFolder: false,
+        });
+      }
     }
   }
 
@@ -215,9 +229,17 @@ ipcMain.handle('set-vault-path', async (event, newPath) => {
   return true;
 });
 
+ipcMain.handle('clear-vault', async () => {
+  store.clear();
+  vaultPath = '';
+  handleVaultChange('', mainWindow);
+  return true;
+});
+
 // IPC Vault File operations
 ipcMain.handle('get-vault-tree', () => {
   try {
+    if (!vaultPath) return [];
     return readDirectoryRecursive(vaultPath);
   } catch (err) {
     console.error(err);

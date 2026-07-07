@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus, Search } from 'lucide-react';
+import { File, Plus, RotateCw, ChevronDown, ChevronRight, Folder, FileText, Tag, Clock, Database, Link2, CheckCircle, FolderOpen, Trash2, X, Edit3, FolderPlus, FilePlus, Search, Move } from 'lucide-react';
 import { fileService } from './file_Service';
 import { vaultService } from './vault_Service';
 import type { ExplorerNode, VaultInfo } from './types';
@@ -92,6 +92,10 @@ function App() {
 
   // Editor State
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+  const activeFilePathRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeFilePathRef.current = activeFilePath;
+  }, [activeFilePath]);
   const [activeFileTitle, setActiveFileTitle] = useState<string>('Untitled');
 
   // Vùng tham chiếu DOM để truy xuất nội dung editor
@@ -113,7 +117,8 @@ function App() {
     x: number;
     y: number;
     node: ExplorerNode | null;
-  }>({ visible: false, x: 0, y: 0, node: null });
+    type?: 'node' | 'vault';
+  }>({ visible: false, x: 0, y: 0, node: null, type: 'node' });
 
   // Structured Knowledge Runtime UI states
   const [editorBlocks, setEditorBlocks] = useState<RuntimeBlock[]>([]);
@@ -133,6 +138,10 @@ function App() {
   // Drag & Drop State
   const [draggedNode, setDraggedNode] = useState<ExplorerNode | null>(null);
   const [draggedOverFolder, setDraggedOverFolder] = useState<string | null>(null);
+
+  // Move Modal State
+  const [movingNode, setMovingNode] = useState<ExplorerNode | null>(null);
+  const [moveSearchQuery, setMoveSearchQuery] = useState('');
 
   // Toast State
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -236,6 +245,18 @@ function App() {
     setScanTrigger(prev => prev + 1);
   }, [getMdFilesFromTree, addToast]);
 
+  const loadVaultInfo = useCallback(async () => {
+    setIsLoadingVault(true);
+    try {
+      const info = await vaultService.getVaultInfo();
+      setVaultInfo(info);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsLoadingVault(false);
+    }
+  }, []);
+
   // Load Vault and directory list on mount with full vault scan
   useEffect(() => {
     const initialize = async () => {
@@ -245,7 +266,7 @@ function App() {
       await initialVaultScan(tree);
     };
     initialize();
-  }, [initialVaultScan]);
+  }, [initialVaultScan, loadVaultInfo]);
 
   // Global click event to close Context Menu
   useEffect(() => {
@@ -293,10 +314,11 @@ function App() {
             }
 
             // If the modified file is the currently active file, reload the editor content
-            if (activeFilePath && normPayloadPath === activeFilePath.replace(/\\/g, '/')) {
+            const currentActivePath = activeFilePathRef.current;
+            if (currentActivePath && normPayloadPath === currentActivePath.replace(/\\/g, '/')) {
               const { properties, remainingContent } = parseFrontmatter(content);
               setNoteProperties(properties);
-              const blocks = extractBlocksFromMarkdown(remainingContent, activeFilePath);
+              const blocks = extractBlocksFromMarkdown(remainingContent, currentActivePath);
               setEditorBlocks(blocks);
             }
           } catch (err) {
@@ -346,19 +368,7 @@ function App() {
       electron.offVaultTreeChanged();
       electron.offVaultChanged();
     };
-  }, [addToast, getMdFilesFromTree, initialVaultScan]);
-
-  const loadVaultInfo = async () => {
-    setIsLoadingVault(true);
-    try {
-      const info = await vaultService.getVaultInfo();
-      setVaultInfo(info);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsLoadingVault(false);
-    }
-  };
+  }, [addToast, getMdFilesFromTree, initialVaultScan, loadVaultInfo]);
 
   const loadTree = async () => {
     try {
@@ -995,8 +1005,53 @@ function App() {
       visible: true,
       x,
       y,
-      node
+      node,
+      type: 'node'
     });
+  };
+
+  const handleVaultContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const menuWidth = 160;
+    const menuHeight = 100;
+    let x = e.clientX;
+    let y = e.clientY;
+
+    if (x + menuWidth > window.innerWidth) {
+      x = window.innerWidth - menuWidth - 10;
+    }
+    if (y + menuHeight > window.innerHeight) {
+      y = window.innerHeight - menuHeight - 10;
+    }
+
+    setContextMenu({
+      visible: true,
+      x,
+      y,
+      node: null,
+      type: 'vault'
+    });
+  };
+
+  const handleClearVault = async () => {
+    try {
+      // @ts-ignore
+      if (window.electron && window.electron.clearVault) {
+        // @ts-ignore
+        await window.electron.clearVault();
+      }
+      setVaultInfo(null);
+      setDirectoryTrees([]);
+      setActiveFilePath(null);
+      setActiveFileTitle('Untitled');
+      if (contentRef.current) {
+        contentRef.current.innerText = '';
+      }
+    } catch (err) {
+      console.error('Failed to clear vault config:', err);
+    }
   };
 
   // Inline Creation Handlers
@@ -1141,6 +1196,37 @@ function App() {
     }
   };
 
+  // Move file or folder to a target path
+  const handleMoveNodeTo = async (node: ExplorerNode, targetFolderPath: string) => {
+    const oldPath = node.path;
+    const fileName = oldPath.split('/').pop()!;
+    const newPath = targetFolderPath ? `${targetFolderPath}/${fileName}` : fileName;
+
+    try {
+      const res = await fileService.moveItem(oldPath, newPath);
+      if (res.success) {
+        ignoreWatcherToast(oldPath, 'delete');
+        ignoreWatcherToast(newPath, 'create');
+        updateTabsAfterRename(oldPath, newPath);
+
+        const updatedAllPaths = getMdFilesFromTree(directoryTrees).map(p => p === oldPath ? newPath : p);
+        await refactorLinksOnRename(oldPath, newPath, updatedAllPaths);
+
+        addToast('modify', `Moved ${fileName} to ${targetFolderPath ? targetFolderPath.split('/').pop() : 'Vault Root'}`);
+        await loadTree();
+
+        if (targetFolderPath) {
+          setExpandedFolders(prev => ({ ...prev, [targetFolderPath]: true }));
+        }
+      } else {
+        addToast('delete', `Failed to move: ${res.error || 'Unknown error'}`);
+      }
+    } catch (error) {
+      console.error(error);
+      addToast('delete', `Failed to move: ${String(error)}`);
+    }
+  };
+
 
 
 
@@ -1187,6 +1273,40 @@ function App() {
     }
     return Array.from(values);
   }, [scanTrigger, directoryTrees]);
+
+  // Get all folders from directory trees in tree order
+  const allFolders = useMemo(() => {
+    const list: { path: string; name: string }[] = [];
+    const traverse = (nodes: ExplorerNode[]) => {
+      for (const node of nodes) {
+        if (node.isFolder) {
+          list.push({ path: node.path, name: node.name });
+          if (node.children) {
+            traverse(node.children);
+          }
+        }
+      }
+    };
+    traverse(directoryTrees);
+    return list;
+  }, [directoryTrees]);
+
+  // Combine folders with the Vault Root
+  const choices = useMemo(() => {
+    return [{ path: '', name: 'Vault Root' }, ...allFolders];
+  }, [allFolders]);
+
+  // Filter folder choices based on the search query
+  const filteredChoices = useMemo(() => {
+    const query = moveSearchQuery.trim().toLowerCase();
+    if (!query) return choices;
+    return choices.filter(choice => {
+      if (choice.path === '') {
+        return 'vault root'.includes(query);
+      }
+      return choice.path.toLowerCase().includes(query) || choice.name.toLowerCase().includes(query);
+    });
+  }, [choices, moveSearchQuery]);
 
   const mentions = useMemo(() => activeFilePath ? queryEngine.getLinkedMentions(activeFilePath, allPaths) : [], [activeFilePath, allPaths, scanTrigger]);
 
@@ -1513,7 +1633,10 @@ function App() {
 
           {/* Vault Footer Info */}
           {!isLoadingVault && vaultInfo?.vaultPath && (
-            <div className="p-4 border-t border-white/5">
+            <div 
+              className="p-4 border-t border-white/5 cursor-context-menu"
+              onContextMenu={handleVaultContextMenu}
+            >
               <div className="flex items-center justify-between">
                 <div>
                   <h1 className="text-sm font-semibold text-white truncate max-w-[180px]">
@@ -2021,69 +2144,224 @@ function App() {
           className="fixed z-50 min-w-[160px] bg-[#1a1d26]/95 backdrop-blur-md border border-white/10 shadow-2xl rounded-xl p-1.5 flex flex-col gap-0.5 animate-in fade-in zoom-in-95 duration-100"
           onClick={(e) => e.stopPropagation()}
         >
-          {(!contextMenu.node || contextMenu.node.isFolder) && (
+          {contextMenu.type === 'vault' ? (
             <>
               <button
                 onClick={() => {
-                  const targetNode = contextMenu.node;
-                  setCreationTarget({ parentPath: targetNode ? targetNode.path : null, isFile: true });
-                  setNewItemName('');
-                  if (targetNode) {
-                    setExpandedFolders(prev => ({ ...prev, [targetNode.path]: true }));
+                  handleSelectVault();
+                  setContextMenu(prev => ({ ...prev, visible: false }));
+                }}
+                className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
+              >
+                <FolderOpen className="w-3.5 h-3.5 text-blue-400" />
+                <span>Change Vault</span>
+              </button>
+              <button
+                onClick={async () => {
+                  setContextMenu(prev => ({ ...prev, visible: false }));
+                  if (confirm("Are you sure you want to clear the vault configuration? This will reset the app state.")) {
+                    await handleClearVault();
                   }
-                  setContextMenu(prev => ({ ...prev, visible: false }));
-                }}
-                className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
-              >
-                <FilePlus className="w-3.5 h-3.5 text-blue-400" />
-                <span>New File</span>
-              </button>
-              <button
-                onClick={() => {
-                  const targetNode = contextMenu.node;
-                  setCreationTarget({ parentPath: targetNode ? targetNode.path : null, isFile: false });
-                  setNewItemName('');
-                  if (targetNode) {
-                    setExpandedFolders(prev => ({ ...prev, [targetNode.path]: true }));
-                  }
-                  setContextMenu(prev => ({ ...prev, visible: false }));
-                }}
-                className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
-              >
-                <FolderPlus className="w-3.5 h-3.5 text-emerald-400" />
-                <span>New Folder</span>
-              </button>
-            </>
-          )}
-
-          {contextMenu.node && (
-            <>
-              {contextMenu.node.isFolder && <div className="h-px bg-white/5 my-0.5" />}
-              <button
-                onClick={() => {
-                  const node = contextMenu.node!;
-                  setRenamingPath(node.path);
-                  setRenamingName(node.name);
-                  setContextMenu(prev => ({ ...prev, visible: false }));
-                }}
-                className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
-              >
-                <Edit3 className="w-3.5 h-3.5 text-yellow-400" />
-                <span>Rename</span>
-              </button>
-              <button
-                onClick={() => {
-                  const node = contextMenu.node!;
-                  handleDeleteItem(node);
-                  setContextMenu(prev => ({ ...prev, visible: false }));
                 }}
                 className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 transition border-0 outline-none text-left w-full cursor-pointer"
               >
                 <Trash2 className="w-3.5 h-3.5" />
-                <span>Delete</span>
+                <span>Clear Vault</span>
               </button>
             </>
+          ) : (
+            <>
+              {(!contextMenu.node || contextMenu.node.isFolder) && (
+                <>
+                  <button
+                    onClick={() => {
+                      const targetNode = contextMenu.node;
+                      setCreationTarget({ parentPath: targetNode ? targetNode.path : null, isFile: true });
+                      setNewItemName('');
+                      if (targetNode) {
+                        setExpandedFolders(prev => ({ ...prev, [targetNode.path]: true }));
+                      }
+                      setContextMenu(prev => ({ ...prev, visible: false }));
+                    }}
+                    className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
+                  >
+                    <FilePlus className="w-3.5 h-3.5 text-blue-400" />
+                    <span>New File</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      const targetNode = contextMenu.node;
+                      setCreationTarget({ parentPath: targetNode ? targetNode.path : null, isFile: false });
+                      setNewItemName('');
+                      if (targetNode) {
+                        setExpandedFolders(prev => ({ ...prev, [targetNode.path]: true }));
+                      }
+                      setContextMenu(prev => ({ ...prev, visible: false }));
+                    }}
+                    className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
+                  >
+                    <FolderPlus className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>New Folder</span>
+                  </button>
+                </>
+              )}
+
+              {contextMenu.node && (
+                <>
+                  {contextMenu.node.isFolder && <div className="h-px bg-white/5 my-0.5" />}
+                  <button
+                    onClick={() => {
+                      const node = contextMenu.node!;
+                      setRenamingPath(node.path);
+                      setRenamingName(node.name);
+                      setContextMenu(prev => ({ ...prev, visible: false }));
+                    }}
+                    className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
+                  >
+                    <Edit3 className="w-3.5 h-3.5 text-yellow-400" />
+                    <span>Rename</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      const node = contextMenu.node!;
+                      setMovingNode(node);
+                      setMoveSearchQuery('');
+                      setContextMenu(prev => ({ ...prev, visible: false }));
+                    }}
+                    className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-300 hover:text-white hover:bg-white/5 transition border-0 outline-none text-left w-full cursor-pointer"
+                  >
+                    <Move className="w-3.5 h-3.5 text-blue-400" />
+                    <span>Move to...</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      const node = contextMenu.node!;
+                      handleDeleteItem(node);
+                      setContextMenu(prev => ({ ...prev, visible: false }));
+                    }}
+                    className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 transition border-0 outline-none text-left w-full cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete</span>
+                  </button>
+                </>
+              )}
+            </>
           )}
+        </div>
+      )}
+
+      {/* Move File/Folder Modal */}
+      {movingNode && (
+        <div 
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" 
+          onClick={() => setMovingNode(null)}
+        >
+          <div 
+            className="bg-[#1a1d26] border border-white/10 shadow-2xl rounded-2xl max-w-md w-full flex flex-col max-h-[80vh] overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 border-b border-white/5">
+              <div className="flex items-center gap-2">
+                <Move className="w-4 h-4 text-blue-400" />
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-white">Move to...</h3>
+                  <p className="text-[11px] text-gray-500 mt-0.5 truncate max-w-[280px]">
+                    Moving <span className="text-gray-300 font-medium">{movingNode.name}</span>
+                  </p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setMovingNode(null)}
+                className="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-white/5 transition border-0 outline-none cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Search Input */}
+            <div className="p-3 border-b border-white/5 bg-[#13161d]/50">
+              <div className="relative flex items-center bg-white/5 border border-white/10 rounded-xl px-3 py-1.5 focus-within:border-blue-500/50 transition">
+                <Search className="w-3.5 h-3.5 text-gray-500 shrink-0 mr-2" />
+                <input
+                  type="text"
+                  placeholder="Search target folder..."
+                  value={moveSearchQuery}
+                  onChange={e => setMoveSearchQuery(e.target.value)}
+                  className="bg-transparent text-white text-xs outline-none w-full placeholder:text-gray-500"
+                  autoFocus
+                />
+                {moveSearchQuery && (
+                  <button 
+                    onClick={() => setMoveSearchQuery('')}
+                    className="text-gray-500 hover:text-white transition border-0 outline-none cursor-pointer"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Folder List */}
+            <div className="flex-1 overflow-y-auto p-3 space-y-1">
+              {filteredChoices.map((choice) => {
+                const getParentPath = (p: string) => {
+                  const parts = p.split('/');
+                  parts.pop();
+                  return parts.join('/');
+                };
+                const currentParentPath = getParentPath(movingNode.path);
+                const isCurrentParent = currentParentPath === choice.path;
+                const isItself = movingNode.isFolder && movingNode.path === choice.path;
+                const isSubfolder = movingNode.isFolder && choice.path.startsWith(movingNode.path + '/');
+                const isDisabled = isCurrentParent || isItself || isSubfolder;
+
+                return (
+                  <button
+                    key={choice.path || '__root__'}
+                    disabled={isDisabled}
+                    onClick={() => {
+                      handleMoveNodeTo(movingNode, choice.path);
+                      setMovingNode(null);
+                    }}
+                    className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition text-xs border-0 outline-none ${
+                      isDisabled 
+                        ? 'opacity-40 cursor-not-allowed text-gray-500 bg-transparent' 
+                        : 'text-gray-300 hover:text-white hover:bg-white/5 cursor-pointer'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Folder className={`w-3.5 h-3.5 shrink-0 ${isDisabled ? 'text-gray-600' : 'text-blue-400'}`} />
+                      <span className="truncate font-medium">
+                        {choice.path === '' ? 'Vault Root' : choice.path}
+                      </span>
+                    </div>
+                    {isCurrentParent && (
+                      <span className="text-[10px] text-gray-500 bg-white/5 px-2 py-0.5 rounded-full shrink-0">
+                        Current
+                      </span>
+                    )}
+                    {isItself && (
+                      <span className="text-[10px] text-yellow-500 bg-yellow-500/5 px-2 py-0.5 rounded-full shrink-0">
+                        Itself
+                      </span>
+                    )}
+                    {isSubfolder && (
+                      <span className="text-[10px] text-red-500 bg-red-500/5 px-2 py-0.5 rounded-full shrink-0">
+                        Subfolder
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              {filteredChoices.length === 0 && (
+                <div className="py-8 text-center text-xs text-gray-500 italic">
+                  No folders found matching your query
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

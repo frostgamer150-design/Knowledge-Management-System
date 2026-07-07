@@ -194,7 +194,7 @@ export function buildRuntimeBlocks(rawBlocks: RawBlock[], sourceFile: string): R
     // Parse the inner content using standard markdown parser
     const subBlocks = parseStandardMarkdown(raw.content);
 
-    if (subBlocks.length === 0) {
+    if (subBlocks.length === 0 || (subBlocks.length === 1 && subBlocks[0].type === 'empty')) {
       // Fallback for empty blocks
       const id = raw.id || generateBlockId(sourceFile, idx, raw.content);
       result.push({
@@ -237,11 +237,27 @@ export function buildRuntimeBlocks(rawBlocks: RawBlock[], sourceFile: string): R
       const absoluteLineStart = raw.lineStart + sub.lineStart - 1;
       const absoluteLineEnd = raw.lineStart + sub.lineEnd - 1;
 
+      // Reconstruct content with markdown prefix if needed
+      let content = sub.content;
+      if (sub.type === 'heading') {
+        const hLevel = sub.level || 1;
+        content = '#'.repeat(hLevel) + ' ' + sub.content;
+      } else if (sub.type === 'list-item') {
+        const checked = sub.checked ?? raw.checked;
+        const prefix = '- ' + (checked !== undefined ? (checked ? '[x] ' : '[ ] ') : '');
+        content = prefix + sub.content;
+      } else if (sub.type === 'quote') {
+        content = sub.content.split('\n').map((line: string) => `> ${line}`).join('\n');
+      } else if (sub.type === 'callout') {
+        const calloutType = sub.info || 'NOTE';
+        content = `> [!${calloutType}]\n` + sub.content.split('\n').map((line: string) => `> ${line}`).join('\n');
+      }
+
       result.push({
         id,
         type: sub.type,
         level: sub.level ?? raw.level,
-        content: sub.content,
+        content,
         info: sub.info ?? raw.info,
         children: inlineNodes,
         parentId: null,

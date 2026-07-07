@@ -4,7 +4,6 @@ const path = require('path');
 let watcher = null;
 
 // Định nghĩa cấu trúc dữ liệu payload cho sự kiện thay đổi file/folder (FilePayload)
-
 function startFileWatch(vaultPath, mainWindow) {
   if (watcher) {
     watcher.close();
@@ -12,7 +11,12 @@ function startFileWatch(vaultPath, mainWindow) {
   }
 
   watcher = chokidar.watch(vaultPath, {
-    ignored: /(^|[\/\\])\../,
+    ignored: (filePath) => {
+      const relative = path.relative(vaultPath, filePath);
+      if (!relative) return false;
+      const segments = relative.split(/[\\/]/);
+      return segments.some(seg => seg.startsWith('.'));
+    },
     persistent: true,
     ignoreInitial: true,
   });

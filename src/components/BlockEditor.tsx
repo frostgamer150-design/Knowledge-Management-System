@@ -359,7 +359,7 @@ function inferBlockTypeAndMetadata(content: string) {
 
   const headingMatch = content.match(/^(#{1,6})\s+(.*)$/);
   if (headingMatch) {
-    return { type: 'heading' };
+    return { type: 'heading', level: headingMatch[1].length };
   }
 
   const checklistMatch = content.match(/^([-*+])\s+\[([ xX])\]\s+(.*)$/);
@@ -927,17 +927,25 @@ export const BlockEditor: React.FC<BlockEditorProps> = ({
 
   const handleContentChange = (index: number, val: string) => {
     const updatedBlocks: RuntimeBlock[] = [...blocks];
-    const inferred = inferBlockTypeAndMetadata(val);
+    const currentBlock = updatedBlocks[index];
+
+    let type = currentBlock.type;
+    let inferred: any = {};
+
+    if (type !== 'code' && type !== 'table') {
+      inferred = inferBlockTypeAndMetadata(val);
+      type = inferred.type as any;
+    }
 
     updatedBlocks[index] = {
-      ...updatedBlocks[index],
+      ...currentBlock,
       content: val,
-      type: inferred.type as any,
-      level: (inferred as any).level ?? updatedBlocks[index].level,
-      info: (inferred as any).info ?? updatedBlocks[index].info,
+      type: type,
+      level: inferred.level ?? currentBlock.level,
+      info: inferred.info ?? currentBlock.info,
       metadata: {
-        ...updatedBlocks[index].metadata,
-        checked: (inferred as any).checked
+        ...currentBlock.metadata,
+        checked: inferred.checked ?? currentBlock.metadata.checked
       }
     };
     onChange(updatedBlocks);
@@ -1039,7 +1047,7 @@ export const BlockEditor: React.FC<BlockEditorProps> = ({
       {blocks.map((block, idx) => {
         const isFocused = focusedBlockId === block.id;
         const isDraggedOver = dragOverBlockId === block.id;
-        const indentLevel = block.level ?? 0;
+        const indentLevel = block.type === 'list-item' ? (block.level ?? 0) : 0;
 
         // CSS Style for custom indentation level
         const blockStyle: React.CSSProperties = {
